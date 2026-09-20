@@ -27,25 +27,34 @@ func (p *Processor) Process(
 		p.Workers = 4
 	}
 
+	if len(tracks) == 0 {
+		return nil
+	}
+
 	jobs := make(chan Track)
 	results := make(chan ProcessResult)
 
 	for i := 0; i < p.Workers; i++ {
+
 		workerID := i + 1
 
 		go func() {
+
 			for {
+
 				select {
+
 				case <-ctx.Done():
 					return
 
 				case track, ok := <-jobs:
+
 					if !ok {
 						return
 					}
 
 					fmt.Printf(
-						"Worker %d resolving: %s - %s\n",
+						"[WORKER %02d] Processing: %s - %s\n",
 						workerID,
 						track.Name,
 						track.Artist,
@@ -57,26 +66,37 @@ func (p *Processor) Process(
 						workerID,
 					)
 
-					results <- ProcessResult{
+					select {
+
+					case results <- ProcessResult{
 						Track: track,
 						Error: err,
+					}:
+
+					case <-ctx.Done():
+						return
 					}
 				}
 			}
+
 		}()
 	}
 
 	go func() {
+
 		defer close(jobs)
 
 		for _, track := range tracks {
+
 			select {
+
 			case <-ctx.Done():
 				return
 
 			case jobs <- track:
 			}
 		}
+
 	}()
 
 	output := make(
@@ -86,8 +106,11 @@ func (p *Processor) Process(
 	)
 
 	for i := 0; i < len(tracks); i++ {
+
 		select {
+
 		case result := <-results:
+
 			output = append(
 				output,
 				result,
@@ -108,11 +131,15 @@ func (p *Processor) processTrack(
 ) error {
 
 	if p.Resolver == nil {
-		return fmt.Errorf("resolver is nil")
+		return fmt.Errorf(
+			"resolver is nil",
+		)
 	}
 
 	if p.Downloader == nil {
-		return fmt.Errorf("downloader is nil")
+		return fmt.Errorf(
+			"downloader is nil",
+		)
 	}
 
 	response, err := p.retryResolve(
@@ -123,6 +150,12 @@ func (p *Processor) processTrack(
 
 	if err != nil {
 		return err
+	}
+
+	if response == nil {
+		return fmt.Errorf(
+			"resolver returned nil response",
+		)
 	}
 
 	if response.DLink == "" {
@@ -149,7 +182,16 @@ func (p *Processor) processTrack(
 		response.Comments,
 	)
 
-	// Send the resolved M4A URL and metadata to saveid3.php.
+	// ----------------------------------------
+	// Save metadata / create MP3
+	// ----------------------------------------
+
+	fmt.Printf(
+		"[WORKER %02d] Saving metadata: %s\n",
+		workerID,
+		track.Name,
+	)
+
 	filename, err := p.Downloader.SaveID3(
 		ctx,
 		track,
@@ -163,12 +205,22 @@ func (p *Processor) processTrack(
 		)
 	}
 
-	// Download the generated MP3.
+	// ----------------------------------------
+	// Download generated MP3
+	// ----------------------------------------
+
+	fmt.Printf(
+		"[WORKER %02d] Downloading MP3: %s\n",
+		workerID,
+		filename,
+	)
+
 	if err := p.Downloader.DownloadSaved(
 		ctx,
 		track,
 		filename,
 	); err != nil {
+
 		return fmt.Errorf(
 			"download generated MP3: %w",
 			err,
@@ -219,9 +271,18 @@ func (p *Processor) retryResolve(
 		)
 
 		if attempt < maxAttempts {
-			delay := time.Duration(attempt) * time.Second
+
+			delay := time.Duration(attempt) *
+				time.Second
+
+			fmt.Printf(
+				"[RESOLVER %02d] Retrying in %s...\n",
+				workerID,
+				delay,
+			)
 
 			select {
+
 			case <-ctx.Done():
 				return nil, ctx.Err()
 

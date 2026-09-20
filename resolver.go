@@ -9,6 +9,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,12 @@ type MediaResolver interface {
 type HTTPMediaResolver struct {
 	Endpoint string
 	Client   *http.Client
+
+	// Maximum number of resolver sessions running at once.
+	Concurrency int
+
+	once      sync.Once
+	semaphore chan struct{}
 }
 
 func (r *HTTPMediaResolver) Resolve(
@@ -47,24 +54,20 @@ func (r *HTTPMediaResolver) Resolve(
 		return nil, fmt.Errorf("resolver endpoint is empty")
 	}
 
-	client := r.Client
-
-	if client == nil {
-		jar, err := cookiejar.New(nil)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"create cookie jar: %w",
-				err,
-			)
-		}
-
-		client = &http.Client{
-			Timeout: 10 * time.Minute,
-			Jar:     jar,
-		}
+	if err := r.acquire(ctx); err != nil {
+		return nil, err
 	}
 
-	// Create a fresh session before every resolver request.
+	defer r.release()
+
+	client, err := r.newSessionClient()
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create resolver session client: %w",
+			err,
+		)
+	}
+
 	if err := refreshSession(ctx, client); err != nil {
 		return nil, fmt.Errorf(
 			"refresh resolver session: %w",
@@ -157,7 +160,10 @@ func (r *HTTPMediaResolver) Resolve(
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(
-		io.LimitReader(resp.Body, 1024*1024),
+		io.LimitReader(
+			resp.Body,
+			1024*1024,
+		),
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -171,7 +177,9 @@ func (r *HTTPMediaResolver) Resolve(
 		resp.Status,
 	)
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.StatusCode < 200 ||
+		resp.StatusCode >= 300 {
+
 		return nil, fmt.Errorf(
 			"resolver HTTP %d: %s; body=%q",
 			resp.StatusCode,
@@ -199,7 +207,7 @@ func (r *HTTPMediaResolver) Resolve(
 
 	if result.DLink == "" {
 		return nil, fmt.Errorf(
-			"resolver returned empty dlink; body=%q",
+			"resolver returned empty download URL; body=%q",
 			string(body),
 		)
 	}
@@ -207,11 +215,74 @@ func (r *HTTPMediaResolver) Resolve(
 	return &result, nil
 }
 
-// refreshSession creates a completely fresh HTTP session.
-//
-// The cookie jar receives cookies from album.php.
-// Those cookies are automatically attached to the following
-// swd.php request.
+func (r *HTTPMediaResolver) acquire(
+	ctx context.Context,
+) error {
+
+	limit := r.Concurrency
+
+	if limit <= 0 {
+		limit = 3
+	}
+
+	r.once.Do(func() {
+		r.semaphore = make(chan struct{}, limit)
+	})
+
+	select {
+
+	case r.semaphore <- struct{}{}:
+		return nil
+
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *HTTPMediaResolver) release() {
+
+	select {
+
+	case <-r.semaphore:
+
+	default:
+	}
+}
+
+func (r *HTTPMediaResolver) newSessionClient() (*http.Client, error) {
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"create cookie jar: %w",
+			err,
+		)
+	}
+
+	timeout := 10 * time.Minute
+
+	var transport http.RoundTripper
+
+	if r.Client != nil {
+
+		transport = r.Client.Transport
+
+		if r.Client.Timeout > 0 {
+			timeout = r.Client.Timeout
+		}
+	}
+
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+
+	return &http.Client{
+		Transport: transport,
+		Jar:       jar,
+		Timeout:   timeout,
+	}, nil
+}
+
 func refreshSession(
 	ctx context.Context,
 	client *http.Client,
@@ -278,7 +349,10 @@ func refreshSession(
 
 	_, _ = io.Copy(
 		io.Discard,
-		io.LimitReader(resp.Body, 1024*1024),
+		io.LimitReader(
+			resp.Body,
+			1024*1024,
+		),
 	)
 
 	fmt.Printf(
@@ -286,7 +360,9 @@ func refreshSession(
 		resp.Status,
 	)
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 ||
+		resp.StatusCode >= 400 {
+
 		return fmt.Errorf(
 			"session HTTP %d: %s",
 			resp.StatusCode,

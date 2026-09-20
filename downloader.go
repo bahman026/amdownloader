@@ -13,8 +13,9 @@ import (
 )
 
 type Downloader struct {
-	Client   *http.Client
-	Progress *ProgressManager
+	Client    *http.Client
+	Progress  *ProgressManager
+	OutputDir string
 }
 
 func (d *Downloader) Download(
@@ -57,7 +58,6 @@ func (d *Downloader) Download(
 		mediaURL,
 		nil,
 	)
-
 	if err != nil {
 		return fmt.Errorf(
 			"create request: %w",
@@ -76,7 +76,6 @@ func (d *Downloader) Download(
 	)
 
 	resp, err := d.Client.Do(req)
-
 	if err != nil {
 		return fmt.Errorf(
 			"download request failed: %w",
@@ -92,7 +91,9 @@ func (d *Downloader) Download(
 		resp.Status,
 	)
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.StatusCode < 200 ||
+		resp.StatusCode >= 300 {
+
 		body, _ := io.ReadAll(
 			io.LimitReader(
 				resp.Body,
@@ -118,8 +119,9 @@ func (d *Downloader) Download(
 		)
 	}
 
-	file, err := os.Create(outputPath)
-
+	file, err := os.Create(
+		outputPath,
+	)
 	if err != nil {
 		return fmt.Errorf(
 			"create output file: %w",
@@ -160,6 +162,7 @@ func (d *Downloader) Download(
 	)
 
 	if err != nil {
+
 		if d.Progress != nil {
 			d.Progress.Complete(
 				track.Index,
@@ -292,7 +295,6 @@ func (d *Downloader) SaveID3(
 	)
 
 	resp, err := d.Client.Do(req)
-
 	if err != nil {
 		return "", fmt.Errorf(
 			"saveid3 request failed: %w",
@@ -316,7 +318,9 @@ func (d *Downloader) SaveID3(
 		)
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	if resp.StatusCode < 200 ||
+		resp.StatusCode >= 300 {
+
 		return "", fmt.Errorf(
 			"saveid3 HTTP %d: %s; body=%q",
 			resp.StatusCode,
@@ -350,7 +354,9 @@ func (d *Downloader) DownloadSaved(
 	filename string,
 ) error {
 
-	filename = strings.TrimSpace(filename)
+	filename = strings.TrimSpace(
+		filename,
+	)
 
 	if filename == "" {
 		return fmt.Errorf(
@@ -362,10 +368,28 @@ func (d *Downloader) DownloadSaved(
 		"https://aaplmusicdownloader.com/api/composer/ffmpeg/saved/" +
 			url.PathEscape(filename)
 
-	outputName := safeFilename(filename)
+	outputDir := d.OutputDir
+
+	if strings.TrimSpace(outputDir) == "" {
+		outputDir = "./downloads"
+	}
+
+	if err := os.MkdirAll(
+		outputDir,
+		0755,
+	); err != nil {
+		return fmt.Errorf(
+			"create output directory: %w",
+			err,
+		)
+	}
+
+	outputName := safeFilename(
+		filename,
+	)
 
 	outputPath := filepath.Join(
-		"./downloads",
+		outputDir,
 		outputName,
 	)
 
