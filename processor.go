@@ -181,6 +181,10 @@ func (p *Processor) Process(
 		if done, how := p.alreadyDownloaded(completed, track, plan); done {
 			p.SkippedCount++
 
+			if p.Downloader.Progress != nil {
+				p.Downloader.Progress.NoteSkipped()
+			}
+
 			p.Log.Printf(
 				"[SKIP %02d] Already downloaded (%s): %s\n",
 				track.Index+1,
@@ -222,6 +226,8 @@ func (p *Processor) Process(
 				dlink, err := p.resolve(ctx, item.track)
 
 				if err != nil {
+					p.noteFailure()
+
 					results <- ProcessResult{
 						Track: item.track,
 						Error: err,
@@ -250,6 +256,8 @@ func (p *Processor) Process(
 				saved, err := p.saveID3(ctx, item)
 
 				if err != nil {
+					p.noteFailure()
+
 					results <- ProcessResult{
 						Track: item.track,
 						Error: err,
@@ -280,6 +288,8 @@ func (p *Processor) Process(
 				item.finalPath = path
 
 				if err != nil {
+					p.noteFailure()
+
 					results <- ProcessResult{
 						Track: item.track,
 						Error: err,
@@ -422,6 +432,12 @@ func (p *Processor) resolve(
 	)
 
 	return dlink, nil
+}
+
+func (p *Processor) noteFailure() {
+	if p.Downloader != nil && p.Downloader.Progress != nil {
+		p.Downloader.Progress.NoteFailed()
+	}
 }
 
 func (p *Processor) transcoding() bool {

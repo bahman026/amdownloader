@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 type DownloadProgress struct {
@@ -20,12 +21,176 @@ type DownloadProgress struct {
 type ProgressManager struct {
 	mu       sync.Mutex
 	progress map[int]*DownloadProgress
+
+	total     int
+	skipped   int
+	failed    int
+	startedAt time.Time
 }
 
 func NewProgressManager() *ProgressManager {
 	return &ProgressManager{
-		progress: make(map[int]*DownloadProgress),
+		progress:  make(map[int]*DownloadProgress),
+		startedAt: time.Now(),
 	}
+}
+
+// SetTotal records how many tracks the run covers, so the display can
+// show position rather than just activity.
+func (p *ProgressManager) SetTotal(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.total = n
+}
+
+// NoteSkipped and NoteFailed keep the counters honest for tracks that
+// never reach the download stage.
+func (p *ProgressManager) NoteSkipped() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.skipped++
+}
+
+func (p *ProgressManager) NoteFailed() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.failed++
+}
+
+func bar(fraction float64, width int) string {
+	if fraction < 0 {
+		fraction = 0
+	}
+
+	if fraction > 1 {
+		fraction = 1
+	}
+
+	filled := int(fraction * float64(width))
+
+	if filled > width {
+		filled = width
+	}
+
+	return strings.Repeat("█", filled) +
+		strings.Repeat("░", width-filled)
+}
+
+// Lines renders the live display: one summary line, then the transfers
+// currently in flight.
+//
+// Only active transfers are listed, so a 600 track run still occupies a
+// handful of lines rather than scrolling off the screen.
+func (p *ProgressManager) Lines(maxActive int) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	var (
+		done    int
+		active  []*DownloadProgress
+		dlBytes int64
+	)
+
+	indexes := make([]int, 0, len(p.progress))
+
+	for index := range p.progress {
+		indexes = append(indexes, index)
+	}
+
+	sort.Ints(indexes)
+
+	for _, index := range indexes {
+		item := p.progress[index]
+
+		dlBytes += item.Current
+
+		if item.Done {
+			done++
+
+			continue
+		}
+
+		active = append(active, item)
+	}
+
+	finished := done + p.skipped
+	elapsed := time.Since(p.startedAt)
+
+	summary := fmt.Sprintf(
+		"  %d/%d  %s  %s",
+		finished,
+		p.total,
+		bar(fractionOf(finished, p.total), 24),
+		formatBytes(dlBytes),
+	)
+
+	if elapsed > time.Second && dlBytes > 0 {
+		summary += fmt.Sprintf(
+			"  %s/s",
+			formatBytes(int64(float64(dlBytes)/elapsed.Seconds())),
+		)
+	}
+
+	// Estimate from completed tracks rather than bytes: track sizes
+	// vary, but the rate of completion is steady enough to be useful.
+	if finished > 0 && finished < p.total {
+		perTrack := elapsed / time.Duration(finished)
+		remaining := (perTrack * time.Duration(p.total-finished)).
+			Round(time.Second)
+
+		summary += "  eta " + remaining.String()
+	}
+
+	if p.skipped > 0 {
+		summary += fmt.Sprintf("  (%d skipped)", p.skipped)
+	}
+
+	if p.failed > 0 {
+		summary += fmt.Sprintf("  (%d failed)", p.failed)
+	}
+
+	lines := []string{summary}
+
+	for i, item := range active {
+		if i >= maxActive {
+			lines = append(lines, fmt.Sprintf(
+				"    ... and %d more", len(active)-maxActive))
+
+			break
+		}
+
+		var fraction float64
+
+		if item.Total > 0 {
+			fraction = float64(item.Current) / float64(item.Total)
+		}
+
+		size := formatBytes(item.Current)
+
+		if item.Total > 0 {
+			size += " / " + formatBytes(item.Total)
+		}
+
+		lines = append(lines, fmt.Sprintf(
+			"    %-34s %s  %s",
+			truncate(item.Label, 34),
+			bar(fraction, 18),
+			size,
+		))
+	}
+
+	return lines
+}
+
+func fractionOf(done, total int) float64 {
+	if total <= 0 {
+		return 0
+	}
+
+	return float64(done) / float64(total)
 }
 
 func (p *ProgressManager) Start(

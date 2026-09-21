@@ -376,6 +376,13 @@ func processTracks(
 	defer log.Close()
 
 	progress := NewProgressManager()
+	progress.SetTotal(len(tracks))
+
+	// Live block under the scrolling log. On a redirected stdout the
+	// logger ignores this and output stays plain.
+	log.SetProgress(func() []string {
+		return progress.Lines(6)
+	})
 
 	// One session, shared by every stage, so the service sees a single
 	// coherent client instead of a new anonymous one per request.
