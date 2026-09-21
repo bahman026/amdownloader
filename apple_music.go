@@ -103,6 +103,13 @@ type appleMusicPage struct {
 			Sections []struct {
 				Items []json.RawMessage `json:"items"`
 			} `json:"sections"`
+
+			// Apple embeds only the first page of tracks and
+			// points here for the remainder.
+			NextIntent struct {
+				Kind string `json:"$kind"`
+				URL  string `json:"url"`
+			} `json:"nextIntent"`
 		} `json:"data"`
 	} `json:"data"`
 }
@@ -298,8 +305,7 @@ func FetchAppleMusicPlaylist(
 
 	for _, pageData := range page.Data {
 
-		for sectionIndex, section :=
-			range pageData.Data.Sections {
+		for sectionIndex, section := range pageData.Data.Sections {
 
 			fmt.Printf(
 				"Section %d: %d items\n",
@@ -307,8 +313,7 @@ func FetchAppleMusicPlaylist(
 				len(section.Items),
 			)
 
-			for itemIndex, rawItem :=
-				range section.Items {
+			for itemIndex, rawItem := range section.Items {
 
 				track, ok :=
 					parseAppleMusicItem(
@@ -381,6 +386,59 @@ func FetchAppleMusicPlaylist(
 		"[DEBUG] Parsed tracks: %d\n",
 		len(parsedTracks),
 	)
+
+	// ----------------------------------------
+	// Fetch the rest of the playlist.
+	//
+	// Apple embeds at most appleMusicPageLimit tracks in the page and
+	// leaves a pointer to the remainder. Without following it a long
+	// playlist silently truncates, which looks like the downloader
+	// stopping early.
+	// ----------------------------------------
+
+	nextURL := ""
+
+	for _, pageData := range page.Data {
+		if pageData.Data.NextIntent.URL != "" {
+			nextURL = pageData.Data.NextIntent.URL
+
+			break
+		}
+	}
+
+	if nextURL != "" {
+		fmt.Printf(
+			"Playlist continues past %d tracks; fetching the rest...\n",
+			len(parsedTracks),
+		)
+
+		more, err := fetchRemainingPlaylistTracks(
+			client,
+			htmlBody,
+			nextURL,
+		)
+
+		// A failure here keeps whatever was embedded in the page
+		// rather than losing the playlist entirely.
+		if err != nil {
+			fmt.Printf(
+				"WARNING: could not fetch the full playlist: %v\n",
+				err,
+			)
+
+			fmt.Printf(
+				"WARNING: continuing with %d of the playlist's tracks\n",
+				len(parsedTracks)+len(more),
+			)
+		}
+
+		parsedTracks = append(parsedTracks, more...)
+
+		fmt.Printf(
+			"Total tracks after pagination: %d\n",
+			len(parsedTracks),
+		)
+	}
 
 	// ----------------------------------------
 	// Do NOT deduplicate tracks.

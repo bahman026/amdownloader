@@ -3,24 +3,122 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
 const resolverEndpoint = "https://aaplmusicdownloader.com/api/composer/swd.php"
 
-// Maximum number of tracks processed simultaneously.
-const workerCount = 10
+const browserUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+	"AppleWebKit/537.36 (KHTML, like Gecko) " +
+	"Chrome/153.0.0.0 Safari/537.36"
 
-// Maximum number of resolver sessions running simultaneously.
-const resolverConcurrency = 3
+// Per-stage deadlines.
+//
+// These replace the single 30 minute client timeout, which meant a stuck
+// resolve held a slot for half an hour. Each stage is now bounded by what
+// that stage should plausibly take.
+const (
+	sessionTimeout  = 60 * time.Second
+	resolveTimeout  = 2 * time.Minute
+	saveTimeout     = 5 * time.Minute
+	downloadTimeout = 30 * time.Minute
+)
+
+// Stage concurrency.
+//
+// Peak concurrent requests against the remote host is 3+3+4 = 10, the
+// same ceiling the old 10-worker pool had. Nothing here is an increase:
+// the gain comes from the stages no longer blocking each other, and from
+// dropping the redundant session fetch, not from more load. Tuning these
+// needs per-stage timings from a real run, which the summary at the end
+// of a run now reports.
+const (
+	defaultResolveConcurrency  = 3
+	defaultSaveConcurrency     = 3
+	defaultDownloadConcurrency = 4
+)
+
+func envInt(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+
+	if raw == "" {
+		return fallback
+	}
+
+	value, err := strconv.Atoi(raw)
+
+	if err != nil || value <= 0 {
+		return fallback
+	}
+
+	return value
+}
+
+// newTransport builds the shared HTTP transport.
+//
+// Pool sizes are kept as they were; they were already well above what
+// this program needs. Proxy support and a dial timeout are restored to
+// match http.DefaultTransport, which the hand-built transport had
+// silently dropped.
+//
+// ForceAttemptHTTP2 is required here, and only here: Go disables its
+// automatic HTTP/2 upgrade as soon as a custom DialContext is set, so
+// adding the dial timeout without this flag would quietly downgrade
+// every request to HTTP/1.1. For the same reason TLSClientConfig is
+// deliberately left nil.
+func newTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+
+		ForceAttemptHTTP2: true,
+
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     100,
+
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
+
+// appSettings is the resolved configuration for this run.
+var appSettings *Settings
 
 func main() {
 	if len(os.Args) > 1 {
 		input := os.Args[1]
+
+		switch strings.ToLower(input) {
+
+		case "settings", "setting", "config":
+			runSettings(os.Args[2:])
+			return
+
+		case "help", "-h", "--help":
+			printUsage()
+			return
+		}
+
+		settings, notes := LoadSettings()
+		appSettings = settings
+
+		for _, note := range notes {
+			fmt.Println(note)
+		}
 
 		if isAppleMusicPlaylistURL(input) {
 			runPlaylist(input)
@@ -31,9 +129,34 @@ func main() {
 			runSingleSong(input)
 			return
 		}
+
+		fmt.Printf("Unrecognised argument: %s\n\n", input)
+		printUsage()
+
+		return
+	}
+
+	settings, notes := LoadSettings()
+	appSettings = settings
+
+	for _, note := range notes {
+		fmt.Println(note)
 	}
 
 	runAlbumDetails()
+}
+
+func printUsage() {
+	fmt.Println("media-cli")
+	fmt.Println()
+	fmt.Println("Usage:")
+	fmt.Println("  media-cli <apple-music-playlist-url>   download a playlist")
+	fmt.Println("  media-cli <apple-music-song-url>       download one song")
+	fmt.Println("  media-cli                              replay ./album_details")
+	fmt.Println("  media-cli settings                     show or change settings")
+	fmt.Println("  media-cli help                         this message")
+	fmt.Println()
+	fmt.Println("A song URL is an /album/ URL containing ?i=<track id>.")
 }
 
 func runPlaylist(input string) {
@@ -64,9 +187,6 @@ func runPlaylist(input string) {
 	fmt.Println("album_details saved to ./album_details")
 	fmt.Printf("Tracks: %d\n", len(tracks))
 	fmt.Printf("Album:  %s\n", playlist.Album)
-	fmt.Printf("Workers: %d\n", workerCount)
-	fmt.Printf("Resolver concurrency: %d\n", resolverConcurrency)
-	fmt.Println()
 
 	albumName := strings.TrimSpace(
 		playlist.Album,
@@ -77,13 +197,13 @@ func runPlaylist(input string) {
 	}
 
 	albumDir := filepath.Join(
-		"./downloads",
+		appSettings.OutputDir,
 		safeFilename(albumName),
 	)
 
 	if err := os.MkdirAll(
 		albumDir,
-		0755,
+		0o755,
 	); err != nil {
 		fmt.Printf(
 			"ERROR: failed to create album directory: %v\n",
@@ -91,13 +211,6 @@ func runPlaylist(input string) {
 		)
 		return
 	}
-
-	fmt.Printf(
-		"Download directory: %s\n",
-		albumDir,
-	)
-
-	fmt.Println()
 
 	processTracks(
 		tracks,
@@ -121,30 +234,11 @@ func runSingleSong(input string) {
 	fmt.Println()
 	fmt.Println("Single song found:")
 
-	fmt.Printf(
-		"Name:     %s\n",
-		track.Name,
-	)
-
-	fmt.Printf(
-		"Artist:   %s\n",
-		track.Artist,
-	)
-
-	fmt.Printf(
-		"Album:    %s\n",
-		track.Album,
-	)
-
-	fmt.Printf(
-		"Duration: %s\n",
-		track.Duration,
-	)
-
-	fmt.Printf(
-		"Link:     %s\n",
-		track.Link,
-	)
+	fmt.Printf("Name:     %s\n", track.Name)
+	fmt.Printf("Artist:   %s\n", track.Artist)
+	fmt.Printf("Album:    %s\n", track.Album)
+	fmt.Printf("Duration: %s\n", track.Duration)
+	fmt.Printf("Link:     %s\n", track.Link)
 
 	fmt.Println()
 
@@ -175,11 +269,11 @@ func runSingleSong(input string) {
 
 	fmt.Println()
 
-	downloadDir := "./downloads"
+	downloadDir := appSettings.OutputDir
 
 	if err := os.MkdirAll(
 		downloadDir,
-		0755,
+		0o755,
 	); err != nil {
 		fmt.Printf(
 			"ERROR: failed to create download directory: %v\n",
@@ -187,23 +281,6 @@ func runSingleSong(input string) {
 		)
 		return
 	}
-
-	fmt.Printf(
-		"Download directory: %s\n",
-		downloadDir,
-	)
-
-	fmt.Printf(
-		"Workers: %d\n",
-		workerCount,
-	)
-
-	fmt.Printf(
-		"Resolver concurrency: %d\n",
-		resolverConcurrency,
-	)
-
-	fmt.Println()
 
 	processTracks(
 		[]Track{track},
@@ -246,13 +323,13 @@ func runAlbumDetails() {
 	}
 
 	albumDir := filepath.Join(
-		"./downloads",
+		appSettings.OutputDir,
 		safeFilename(albumName),
 	)
 
 	if err := os.MkdirAll(
 		albumDir,
-		0755,
+		0o755,
 	); err != nil {
 		fmt.Printf(
 			"Failed to create download directory: %v\n",
@@ -260,23 +337,6 @@ func runAlbumDetails() {
 		)
 		return
 	}
-
-	fmt.Printf(
-		"Download directory: %s\n",
-		albumDir,
-	)
-
-	fmt.Printf(
-		"Workers: %d\n",
-		workerCount,
-	)
-
-	fmt.Printf(
-		"Resolver concurrency: %d\n",
-		resolverConcurrency,
-	)
-
-	fmt.Println()
 
 	processTracks(
 		tracks,
@@ -289,43 +349,100 @@ func processTracks(
 	downloadDir string,
 ) {
 
-	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		MaxConnsPerHost:     100,
+	// Ctrl-C cancels in-flight work instead of killing the process
+	// mid-write. Partial transfers live in .part files and are removed
+	// on the way out, so an interrupted run never leaves something that
+	// looks like a finished download.
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
 
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-
+	// A single transport, shared by the resolver, the metadata stage
+	// and downloads, so connections stay pooled across all of them.
+	//
+	// Client.Timeout is intentionally zero: a single deadline covering
+	// every kind of request cannot be right for both a JSON call and a
+	// 7 MiB transfer. Each stage sets its own via context instead.
 	client := &http.Client{
-		Timeout:   30 * time.Minute,
-		Transport: transport,
+		Transport: newTransport(),
 	}
+
+	log := NewLogger(os.Stdout)
+	defer log.Close()
 
 	progress := NewProgressManager()
 
+	// One session, shared by every stage, so the service sees a single
+	// coherent client instead of a new anonymous one per request.
+	session := &SessionManager{
+		Transport: client.Transport,
+		Log:       log,
+	}
+
 	resolver := &HTTPMediaResolver{
-		Endpoint:    resolverEndpoint,
-		Client:      client,
-		Concurrency: resolverConcurrency,
+		Endpoint: resolverEndpoint,
+		Session:  session,
+		Log:      log,
 	}
 
 	downloader := &Downloader{
-		Client:    client,
+		Session:   session,
 		Progress:  progress,
 		OutputDir: downloadDir,
+		Log:       log,
+
+		DisableLegacyDetection: !appSettings.DetectLegacyNames,
 	}
 
 	processor := &Processor{
-		Workers:    workerCount,
+		ResolveConcurrency:  appSettings.ResolveConcurrency,
+		SaveConcurrency:     appSettings.SaveConcurrency,
+		DownloadConcurrency: appSettings.DownloadConcurrency,
+
+		Quality:             appSettings.Quality,
+		DisableSkipExisting: !appSettings.SkipExisting,
+
 		Resolver:   resolver,
 		Downloader: downloader,
 		OutputDir:  downloadDir,
+		Log:        log,
+
+		// The resolver is cheap and idempotent, so it gets the most
+		// attempts. The metadata stage triggers a server side
+		// transcode, so it gets the fewest.
+		ResolveRetry: retryPolicy{
+			MaxAttempts: appSettings.ResolveAttempts,
+			BaseDelay:   500 * time.Millisecond,
+			MaxDelay:    10 * time.Second,
+		},
+
+		SaveRetry: retryPolicy{
+			MaxAttempts: appSettings.SaveAttempts,
+			BaseDelay:   2 * time.Second,
+			MaxDelay:    15 * time.Second,
+		},
+
+		DownloadRetry: retryPolicy{
+			MaxAttempts: appSettings.DownloadAttempts,
+			BaseDelay:   1 * time.Second,
+			MaxDelay:    20 * time.Second,
+		},
 	}
 
-	ctx := context.Background()
+	fmt.Printf("Download directory: %s\n", downloadDir)
+
+	fmt.Printf(
+		"Concurrency: resolve=%d save=%d download=%d   Quality: %d\n",
+		processor.ResolveConcurrency,
+		processor.SaveConcurrency,
+		processor.DownloadConcurrency,
+		processor.Quality,
+	)
+
+	fmt.Println()
 
 	start := time.Now()
 
@@ -334,8 +451,12 @@ func processTracks(
 		tracks,
 	)
 
+	log.Close()
+
 	printResults(
 		results,
+		processor,
+		session,
 		start,
 	)
 }
@@ -380,6 +501,8 @@ func isAppleMusicSongURL(
 
 func printResults(
 	results []ProcessResult,
+	processor *Processor,
+	session *SessionManager,
 	start time.Time,
 ) {
 
@@ -390,8 +513,17 @@ func printResults(
 
 	success := 0
 	failed := 0
+	skipped := 0
+
+	var bytes int64
 
 	for _, result := range results {
+
+		if result.Skipped {
+			skipped++
+
+			continue
+		}
 
 		if result.Error != nil {
 
@@ -408,6 +540,7 @@ func printResults(
 		}
 
 		success++
+		bytes += result.Bytes
 
 		fmt.Printf(
 			"[SUCCESS %02d] %s - %s\n",
@@ -419,23 +552,57 @@ func printResults(
 
 	fmt.Println()
 
-	fmt.Printf(
-		"Total:   %d\n",
-		len(results),
-	)
+	fmt.Printf("Total:       %d\n", len(results))
+	fmt.Printf("Success:     %d\n", success)
+	fmt.Printf("Skipped:     %d\n", skipped)
+	fmt.Printf("Failed:      %d\n", failed)
+	fmt.Printf("Downloaded:  %s\n", formatBytes(bytes))
+	fmt.Printf("Time:        %s\n", time.Since(start).Round(time.Millisecond))
+
+	if processor == nil {
+		return
+	}
+
+	// Per-stage timings, so the concurrency settings above can be
+	// tuned from measurements rather than assumptions.
+	fmt.Println()
+	fmt.Println("Stage timings (per track)")
+
+	printStage("resolve ", &processor.ResolveStats)
+	printStage("saveid3 ", &processor.SaveStats)
+	printStage("download", &processor.DownloadStats)
+
+	if session == nil {
+		return
+	}
+
+	rotations, observedLimit := session.Stats()
+
+	fmt.Println()
+	fmt.Printf("Sessions established: %d\n", rotations)
+
+	if observedLimit > 0 {
+		fmt.Printf(
+			"Observed service session limit: ~%d uses\n",
+			observedLimit,
+		)
+	}
+}
+
+func printStage(name string, stats *StageStats) {
+	count, avg, max := stats.Snapshot()
+
+	if count == 0 {
+		fmt.Printf("  %s  n=0\n", name)
+
+		return
+	}
 
 	fmt.Printf(
-		"Success: %d\n",
-		success,
-	)
-
-	fmt.Printf(
-		"Failed:  %d\n",
-		failed,
-	)
-
-	fmt.Printf(
-		"Time:    %s\n",
-		time.Since(start).Round(time.Millisecond),
+		"  %s  n=%-4d avg=%-10s max=%s\n",
+		name,
+		count,
+		avg.Round(time.Millisecond),
+		max.Round(time.Millisecond),
 	)
 }

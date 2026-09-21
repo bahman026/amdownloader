@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -77,21 +78,43 @@ func (p *ProgressManager) Complete(
 	}
 }
 
-func (p *ProgressManager) Render() {
+// Snapshot returns a copy of the current state, ordered by track index.
+func (p *ProgressManager) Snapshot() []DownloadProgress {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	fmt.Print("\033[H\033[2J")
+	indexes := make([]int, 0, len(p.progress))
 
-	fmt.Println("Downloads")
-	fmt.Println(strings.Repeat("─", 100))
+	for index := range p.progress {
+		indexes = append(indexes, index)
+	}
 
-	for i := 0; i < len(p.progress); i++ {
-		item, ok := p.progress[i]
-		if !ok {
-			continue
-		}
+	sort.Ints(indexes)
 
+	items := make([]DownloadProgress, 0, len(indexes))
+
+	for _, index := range indexes {
+		items = append(items, *p.progress[index])
+	}
+
+	return items
+}
+
+// Render draws the current state of every download.
+//
+// The previous version walked indexes 0..len-1 and looked each one up as
+// a map key. Keys are track indexes and are sparse while a run is in
+// flight, so with tracks 5 and 7 downloading it probed keys 0 and 1 and
+// drew nothing. It now iterates the entries that actually exist.
+func (p *ProgressManager) Render(out io.Writer) {
+	items := p.Snapshot()
+
+	fmt.Fprint(out, "\033[H\033[2J")
+
+	fmt.Fprintln(out, "Downloads")
+	fmt.Fprintln(out, strings.Repeat("─", 100))
+
+	for _, item := range items {
 		label := truncate(item.Label, 32)
 
 		const barWidth = 30
@@ -115,6 +138,10 @@ func (p *ProgressManager) Render() {
 			filled = barWidth
 		}
 
+		if filled < 0 {
+			filled = 0
+		}
+
 		bar := strings.Repeat("█", filled) +
 			strings.Repeat("░", barWidth-filled)
 
@@ -131,7 +158,8 @@ func (p *ProgressManager) Render() {
 			}
 		}
 
-		fmt.Printf(
+		fmt.Fprintf(
+			out,
 			"[%02d] %-32s [%s] %s  %s / %s\n",
 			item.Index+1,
 			label,
@@ -142,7 +170,7 @@ func (p *ProgressManager) Render() {
 		)
 	}
 
-	fmt.Println(strings.Repeat("─", 100))
+	fmt.Fprintln(out, strings.Repeat("─", 100))
 }
 
 type ProgressReader struct {

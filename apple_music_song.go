@@ -184,6 +184,13 @@ func FetchAppleMusicSong(
 		)
 	}
 
+	// A single-song page carries no tertiaryLinks on the song itself;
+	// the containing album is a sibling item on the page instead.
+	// Without this the ID3 album tag was always "Unknown Album".
+	if album == "" {
+		album = findAppleMusicAlbumTitle(root)
+	}
+
 	thumb := item.Artwork.Dictionary.URL
 
 	if thumb == "" {
@@ -511,6 +518,44 @@ func findAppleMusicSong(
 	}
 
 	return appleMusicSongItem{}, false
+}
+
+// findAppleMusicAlbumTitle returns the title of the album item on the
+// page, which is how a single-song page names the album the track
+// belongs to.
+func findAppleMusicAlbumTitle(value interface{}) string {
+
+	switch current := value.(type) {
+
+	case map[string]interface{}:
+
+		if getNestedString(
+			current,
+			"contentDescriptor",
+			"kind",
+		) == "album" {
+
+			if title := getString(current, "title"); title != "" {
+				return title
+			}
+		}
+
+		for _, child := range current {
+			if title := findAppleMusicAlbumTitle(child); title != "" {
+				return title
+			}
+		}
+
+	case []interface{}:
+
+		for _, child := range current {
+			if title := findAppleMusicAlbumTitle(child); title != "" {
+				return title
+			}
+		}
+	}
+
+	return ""
 }
 
 func convertSongItem(
