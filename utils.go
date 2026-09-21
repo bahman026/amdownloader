@@ -60,25 +60,38 @@ func extensionFromURL(rawURL string) string {
 		return ""
 	}
 
-	ext := filepath.Ext(
-		path.Base(u.Path),
+	// path.Base("") is ".", and filepath.Ext(".") is "." -- a bare dot
+	// is not an extension, and returning one produces paths like
+	// "Track." that match no file on disk.
+	ext := cleanExtension(
+		filepath.Ext(path.Base(u.Path)),
 	)
 
 	if ext != "" {
-		return strings.ToLower(ext)
+		return ext
 	}
 
 	fname := u.Query().Get("fname")
 
 	if fname != "" {
-		ext = filepath.Ext(fname)
-
-		if ext != "" {
-			return strings.ToLower(ext)
+		if ext := cleanExtension(filepath.Ext(fname)); ext != "" {
+			return ext
 		}
 	}
 
 	return ""
+}
+
+// cleanExtension normalises an extension, rejecting the degenerate
+// results filepath.Ext can return for empty or dot-only names.
+func cleanExtension(ext string) string {
+	ext = strings.ToLower(strings.TrimSpace(ext))
+
+	if ext == "" || ext == "." {
+		return ""
+	}
+
+	return ext
 }
 
 // stemOf strips a single trailing extension from a file name.

@@ -17,13 +17,10 @@ const settingsFile = "settings.json"
 // Settings holds the user-configurable behaviour of the program.
 //
 // Every field here actually changes what the program does. Audio format
-// is deliberately absent: the remote service decides the container and
-// codec, and exposing a knob that silently did nothing would be worse
-// than not having one.
+// and bitrate are deliberately absent: the service hands back a fixed
+// .m4a and transcodes it to a fixed 128 kbps MP3, taking no bitrate
+// parameter at all. A knob for either would silently do nothing.
 type Settings struct {
-	// Quality is the bitrate requested from the resolver.
-	Quality int `json:"quality"`
-
 	// OutputDir is the base directory downloads are written under.
 	OutputDir string `json:"output_dir"`
 
@@ -42,11 +39,39 @@ type Settings struct {
 	// DetectLegacyNames also recognises files saved under the older
 	// naming scheme when deciding what is already downloaded.
 	DetectLegacyNames bool `json:"detect_legacy_names"`
+
+	// Lyrics controls whether synchronised lyrics are looked up on
+	// LRCLIB and embedded into each finished MP3.
+	Lyrics bool `json:"lyrics"`
+
+	// LyricsLanguage is the 3-letter code recorded in the ID3 frame.
+	LyricsLanguage string `json:"lyrics_language"`
+
+	LyricsConcurrency int `json:"lyrics_concurrency"`
+
+	// AudioMode selects where the MP3 comes from.
+	//
+	//   "service"   the remote service transcodes it, fixed 128 kbps
+	//   "transcode" download the ~273 kbps AAC source and encode it
+	//               here, at TranscodeBitrate
+	AudioMode string `json:"audio_mode"`
+
+	// TranscodeBitrate is the kbps of the local encode. Unlike the
+	// removed "quality" setting, this one reaches a real encoder and
+	// genuinely changes the output.
+	TranscodeBitrate int `json:"transcode_bitrate"`
+
+	// FFmpegPath overrides binary discovery. Empty means use PATH.
+	FFmpegPath string `json:"ffmpeg_path"`
 }
+
+const (
+	audioModeService   = "service"
+	audioModeTranscode = "transcode"
+)
 
 func DefaultSettings() *Settings {
 	return &Settings{
-		Quality:             128,
 		OutputDir:           "./downloads",
 		ResolveConcurrency:  defaultResolveConcurrency,
 		SaveConcurrency:     defaultSaveConcurrency,
@@ -56,11 +81,13 @@ func DefaultSettings() *Settings {
 		DownloadAttempts:    3,
 		SkipExisting:        true,
 		DetectLegacyNames:   true,
+		Lyrics:              true,
+		LyricsLanguage:      "und",
+		LyricsConcurrency:   4,
+		AudioMode:           audioModeService,
+		TranscodeBitrate:    320,
 	}
 }
-
-// validQualities are the bitrates the resolver accepts.
-var validQualities = []int{128, 256, 320}
 
 // LoadSettings reads settings.json if present, falling back to defaults,
 // then applies any environment overrides.
@@ -76,6 +103,8 @@ func LoadSettings() (*Settings, []string) {
 	switch {
 
 	case err == nil:
+		notes = append(notes, unknownKeyNotes(raw)...)
+
 		if err := json.Unmarshal(raw, settings); err != nil {
 			notes = append(notes, fmt.Sprintf(
 				"WARNING: %s is not valid JSON (%v); using defaults",
@@ -96,8 +125,6 @@ func LoadSettings() (*Settings, []string) {
 
 	// Environment overrides win, so a one-off run can differ from the
 	// saved configuration without editing it.
-	settings.Quality = envInt("MEDIA_CLI_QUALITY", settings.Quality)
-
 	settings.ResolveConcurrency = envInt(
 		"MEDIA_CLI_RESOLVE_CONCURRENCY", settings.ResolveConcurrency)
 
@@ -106,6 +133,9 @@ func LoadSettings() (*Settings, []string) {
 
 	settings.DownloadConcurrency = envInt(
 		"MEDIA_CLI_DOWNLOAD_CONCURRENCY", settings.DownloadConcurrency)
+
+	settings.LyricsConcurrency = envInt(
+		"MEDIA_CLI_LYRICS_CONCURRENCY", settings.LyricsConcurrency)
 
 	if dir := strings.TrimSpace(os.Getenv("MEDIA_CLI_OUTPUT_DIR")); dir != "" {
 		settings.OutputDir = dir
@@ -120,18 +150,33 @@ func LoadSettings() (*Settings, []string) {
 func (s *Settings) normalize() []string {
 	var notes []string
 
-	if !containsInt(validQualities, s.Quality) {
-		notes = append(notes, fmt.Sprintf(
-			"WARNING: quality %d is not one of %v; using 128",
-			s.Quality,
-			validQualities,
-		))
-
-		s.Quality = 128
-	}
-
 	if strings.TrimSpace(s.OutputDir) == "" {
 		s.OutputDir = "./downloads"
+	}
+
+	if len(s.LyricsLanguage) != 3 {
+		s.LyricsLanguage = "und"
+	}
+
+	if s.AudioMode != audioModeService && s.AudioMode != audioModeTranscode {
+		if strings.TrimSpace(s.AudioMode) != "" {
+			notes = append(notes, fmt.Sprintf(
+				"WARNING: audio_mode %q is not %s or %s; using %s",
+				s.AudioMode, audioModeService, audioModeTranscode,
+				audioModeService,
+			))
+		}
+
+		s.AudioMode = audioModeService
+	}
+
+	if !containsInt(validBitrates, s.TranscodeBitrate) {
+		notes = append(notes, fmt.Sprintf(
+			"WARNING: transcode_bitrate %d is not one of %v; using 320",
+			s.TranscodeBitrate, validBitrates,
+		))
+
+		s.TranscodeBitrate = 320
 	}
 
 	clamp := func(name string, value *int, min, max int) {
@@ -154,6 +199,7 @@ func (s *Settings) normalize() []string {
 	clamp("resolve_concurrency", &s.ResolveConcurrency, 1, 16)
 	clamp("save_concurrency", &s.SaveConcurrency, 1, 16)
 	clamp("download_concurrency", &s.DownloadConcurrency, 1, 16)
+	clamp("lyrics_concurrency", &s.LyricsConcurrency, 1, 16)
 	clamp("resolve_attempts", &s.ResolveAttempts, 1, 10)
 	clamp("save_attempts", &s.SaveAttempts, 1, 10)
 	clamp("download_attempts", &s.DownloadAttempts, 1, 10)
@@ -167,15 +213,29 @@ func (s *Settings) normalize() []string {
 // hand. An explicit `settings set` should not silently store something
 // other than what was asked for, so that path validates instead.
 func (s *Settings) validate() error {
-	if !containsInt(validQualities, s.Quality) {
+	if strings.TrimSpace(s.OutputDir) == "" {
+		return fmt.Errorf("output_dir cannot be empty")
+	}
+
+	if len(s.LyricsLanguage) != 3 {
 		return fmt.Errorf(
-			"quality must be one of %v",
-			validQualities,
+			"lyrics_language must be a 3-letter code, got %q",
+			s.LyricsLanguage,
 		)
 	}
 
-	if strings.TrimSpace(s.OutputDir) == "" {
-		return fmt.Errorf("output_dir cannot be empty")
+	if s.AudioMode != audioModeService && s.AudioMode != audioModeTranscode {
+		return fmt.Errorf(
+			"audio_mode must be %q or %q, got %q",
+			audioModeService, audioModeTranscode, s.AudioMode,
+		)
+	}
+
+	if !containsInt(validBitrates, s.TranscodeBitrate) {
+		return fmt.Errorf(
+			"transcode_bitrate must be one of %v",
+			validBitrates,
+		)
 	}
 
 	ranges := []struct {
@@ -186,6 +246,7 @@ func (s *Settings) validate() error {
 		{"resolve_concurrency", s.ResolveConcurrency, 1, 16},
 		{"save_concurrency", s.SaveConcurrency, 1, 16},
 		{"download_concurrency", s.DownloadConcurrency, 1, 16},
+		{"lyrics_concurrency", s.LyricsConcurrency, 1, 16},
 		{"resolve_attempts", s.ResolveAttempts, 1, 10},
 		{"save_attempts", s.SaveAttempts, 1, 10},
 		{"download_attempts", s.DownloadAttempts, 1, 10},
@@ -201,6 +262,53 @@ func (s *Settings) validate() error {
 	}
 
 	return nil
+}
+
+// obsoleteKeys are settings that once existed and no longer do, with
+// the reason. A stale key sitting in the file silently doing nothing is
+// how someone ends up believing a setting is applied when it is not.
+var obsoleteKeys = map[string]string{
+	"quality": "removed: the service ignores it and always returns " +
+		"128 kbps. Use audio_mode=transcode with transcode_bitrate.",
+	"format": "removed: the output format is not selectable.",
+}
+
+// unknownKeyNotes reports keys in the file that the program does not
+// use, so they cannot quietly imply an effect they do not have.
+func unknownKeyNotes(raw []byte) []string {
+	var present map[string]json.RawMessage
+
+	if err := json.Unmarshal(raw, &present); err != nil {
+		return nil
+	}
+
+	known := settingFields()
+
+	var notes []string
+
+	for key := range present {
+		if _, ok := known[key]; ok {
+			continue
+		}
+
+		if reason, ok := obsoleteKeys[key]; ok {
+			notes = append(notes, fmt.Sprintf(
+				"NOTE: %q in %s is %s",
+				key, settingsFile, reason,
+			))
+
+			continue
+		}
+
+		notes = append(notes, fmt.Sprintf(
+			"NOTE: %q in %s is not a known setting and is ignored",
+			key, settingsFile,
+		))
+	}
+
+	sort.Strings(notes)
+
+	return notes
 }
 
 func containsInt(values []int, want int) bool {
@@ -260,11 +368,6 @@ func settingFields() map[string]field {
 	}
 
 	return map[string]field{
-		"quality": {
-			get:  func(s *Settings) string { return strconv.Itoa(s.Quality) },
-			set:  setInt(func(s *Settings, v int) { s.Quality = v }),
-			help: "bitrate requested from the resolver (128, 256 or 320)",
-		},
 		"output_dir": {
 			get: func(s *Settings) string { return s.OutputDir },
 			set: func(s *Settings, raw string) error {
@@ -316,6 +419,56 @@ func settingFields() map[string]field {
 			get:  func(s *Settings) string { return strconv.FormatBool(s.DetectLegacyNames) },
 			set:  setBool(func(s *Settings, v bool) { s.DetectLegacyNames = v }),
 			help: "also recognise files saved under the old naming scheme",
+		},
+		"lyrics": {
+			get:  func(s *Settings) string { return strconv.FormatBool(s.Lyrics) },
+			set:  setBool(func(s *Settings, v bool) { s.Lyrics = v }),
+			help: "look up synced lyrics on LRCLIB and embed them",
+		},
+		"lyrics_language": {
+			get: func(s *Settings) string { return s.LyricsLanguage },
+			set: func(s *Settings, raw string) error {
+				raw = strings.ToLower(strings.TrimSpace(raw))
+				if len(raw) != 3 {
+					return fmt.Errorf(
+						"expected a 3-letter code such as eng, got %q", raw)
+				}
+				s.LyricsLanguage = raw
+				return nil
+			},
+			help: "3-letter language code recorded in the lyrics frame",
+		},
+		"audio_mode": {
+			get: func(s *Settings) string { return s.AudioMode },
+			set: func(s *Settings, raw string) error {
+				raw = strings.ToLower(strings.TrimSpace(raw))
+				if raw != audioModeService && raw != audioModeTranscode {
+					return fmt.Errorf(
+						"expected %q or %q, got %q",
+						audioModeService, audioModeTranscode, raw)
+				}
+				s.AudioMode = raw
+				return nil
+			},
+			help: "service (128k, remote) or transcode (local encode of the AAC source)",
+		},
+		"transcode_bitrate": {
+			get:  func(s *Settings) string { return strconv.Itoa(s.TranscodeBitrate) },
+			set:  setInt(func(s *Settings, v int) { s.TranscodeBitrate = v }),
+			help: "kbps for the local encode (128, 192, 256 or 320)",
+		},
+		"ffmpeg_path": {
+			get: func(s *Settings) string { return s.FFmpegPath },
+			set: func(s *Settings, raw string) error {
+				s.FFmpegPath = strings.TrimSpace(raw)
+				return nil
+			},
+			help: "path to ffmpeg; empty means look it up on PATH",
+		},
+		"lyrics_concurrency": {
+			get:  func(s *Settings) string { return strconv.Itoa(s.LyricsConcurrency) },
+			set:  setInt(func(s *Settings, v int) { s.LyricsConcurrency = v }),
+			help: "parallel lyrics lookups (1-16)",
 		},
 	}
 }
@@ -449,9 +602,10 @@ func (s *Settings) Print(out io.Writer) {
 	fmt.Fprintln(out, "Change one with:  media-cli settings set <key> <value>")
 	fmt.Fprintln(out, "Environment variables override these for a single run.")
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, "Audio format is not configurable: the remote service")
-	fmt.Fprintln(out, "decides the container and codec, and the file extension")
-	fmt.Fprintln(out, "follows whatever it returns.")
+	fmt.Fprintln(out, "audio_mode=service takes the MP3 the remote service")
+	fmt.Fprintln(out, "makes, which is always 128 kbps whatever is requested.")
+	fmt.Fprintln(out, "audio_mode=transcode downloads the ~273 kbps AAC source")
+	fmt.Fprintln(out, "instead and encodes it locally, and needs ffmpeg.")
 }
 
 func printSettingKeys(out io.Writer) {

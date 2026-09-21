@@ -27,6 +27,7 @@ type fakeService struct {
 	swdHits     atomic.Int64
 	saveHits    atomic.Int64
 	savedHits   atomic.Int64
+	sourceHits  atomic.Int64
 	sessionsMin atomic.Int64
 
 	// usesPerSession counts requests carrying each session id.
@@ -110,7 +111,8 @@ func newFakeService(t *testing.T, limit int) *fakeService {
 
 		fmt.Fprintf(
 			w,
-			`{"dlink":"https://cdn.example/%s.m4a","status":"ok","comments":""}`,
+			`{"dlink":"%s/source/%s.m4a","status":"ok","comments":""}`,
+			svc.server.URL,
 			r.Form.Get("song_name"),
 		)
 	})
@@ -130,6 +132,14 @@ func newFakeService(t *testing.T, limit int) *fakeService {
 			r.Form.Get("name"),
 			r.Form.Get("artist"),
 		)
+	})
+
+	// The AAC source the resolver points at, used by transcode mode.
+	mux.HandleFunc("/source/", func(w http.ResponseWriter, r *http.Request) {
+		svc.sourceHits.Add(1)
+
+		w.Header().Set("Content-Length", fmt.Sprint(len(svc.payload)))
+		w.Write(svc.payload)
 	})
 
 	mux.HandleFunc("/saved/", func(w http.ResponseWriter, r *http.Request) {

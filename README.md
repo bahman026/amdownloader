@@ -151,7 +151,6 @@ media-cli settings path                     # where the file lives
 
 | Key | Default | Meaning |
 |---|---|---|
-| `quality` | `128` | bitrate requested from the resolver (128, 256, 320) |
 | `output_dir` | `./downloads` | base directory downloads are written under |
 | `resolve_concurrency` | `3` | parallel resolve requests (1-16) |
 | `save_concurrency` | `3` | parallel MP3 generation requests (1-16) |
@@ -161,14 +160,55 @@ media-cli settings path                     # where the file lives
 | `download_attempts` | `3` | attempts per file transfer (1-10) |
 | `skip_existing` | `true` | skip tracks already on disk, before any request |
 | `detect_legacy_names` | `true` | also recognise files saved under the old naming scheme |
+| `audio_mode` | `service` | `service` (128k, remote) or `transcode` (local encode) |
+| `transcode_bitrate` | `320` | kbps for the local encode (128, 192, 256, 320) |
+| `ffmpeg_path` | *(empty)* | path to ffmpeg; empty means look it up on `PATH` |
+| `lyrics` | `true` | look up synced lyrics on LRCLIB and embed them |
+| `lyrics_language` | `und` | 3-letter code recorded in the lyrics frame |
+| `lyrics_concurrency` | `4` | parallel lyrics lookups (1-16) |
 
 `settings set` rejects out-of-range values and leaves the file untouched.
 A `settings.json` edited by hand is clamped instead, with a warning, so a
 bad value can never stop a run. Malformed JSON falls back to defaults.
 
-**Audio format is not configurable.** The remote service decides the
-container and codec; the file extension follows whatever it returns.
-A format setting here would not change what you get, so there isn't one.
+## Audio quality
+
+There are two paths, chosen with `audio_mode`.
+
+| | `service` (default) | `transcode` |
+|---|---|---|
+| Source | the service's own MP3 | the AAC the resolver points at |
+| Bitrate | **128 kbps, fixed** | `transcode_bitrate`, default **320** |
+| Typical size (4:41) | 6.5 MB | ~11 MB |
+| Server-side transcode | yes | **skipped entirely** |
+| Needs ffmpeg | no | **yes** |
+| ID3 tags, artwork, lyrics | yes | yes |
+
+```bash
+brew install ffmpeg
+media-cli settings set audio_mode transcode
+```
+
+**Why there is no `quality` setting.** The resolver accepts a `quality`
+parameter and ignores it: at 128 and at 320 it returns the same `.m4a`,
+differing only in which CDN node serves it. The MP3 is then built by
+`saveid3.php`, which takes no bitrate at all. Measured across 224 files,
+every one was 128 kbps. A `quality` setting existed briefly and was
+removed rather than left as a control that does nothing.
+
+`transcode_bitrate` is different: it is passed to your local encoder and
+genuinely changes the output.
+
+**An honest caveat.** The source measures ~273 kbps AAC. Encoding that
+to a 320 kbps MP3 is a second lossy pass, so it is very slightly worse
+than the AAC itself while being much better than the service's 128 kbps
+MP3. The larger number does not add information. If you want the best
+available audio with no re-encoding at all, the untouched `.m4a` is it —
+but MP4 uses atom tagging rather than ID3, so artwork and SYLT lyrics
+would need separate work.
+
+In `transcode` mode the service's `saveid3.php` step is never called, so
+its transcode queue is skipped and runs are faster.
 
 ### Environment overrides
 
@@ -182,8 +222,8 @@ against the service.
 | `MEDIA_CLI_RESOLVE_CONCURRENCY` | `3` | resolve track → media URL |
 | `MEDIA_CLI_SAVE_CONCURRENCY` | `3` | server-side MP3 generation |
 | `MEDIA_CLI_DOWNLOAD_CONCURRENCY` | `4` | transfer the generated file |
-| `MEDIA_CLI_QUALITY` | `128` | requested bitrate |
 | `MEDIA_CLI_OUTPUT_DIR` | `./downloads` | base download directory |
+| `MEDIA_CLI_LYRICS_CONCURRENCY` | `4` | parallel lyrics lookups |
 
 ```bash
 MEDIA_CLI_DOWNLOAD_CONCURRENCY=6 ./media-cli
@@ -318,12 +358,52 @@ go vet ./...
 
 ---
 
-## How it works
+## Lyrics
 
-Three independently bounded stages, connected by channels:
+After a track downloads, synchronised lyrics are looked up on
+[LRCLIB](https://lrclib.net) and written into the MP3 as an ID3
+**SYLT** frame. There is no separate `.lrc` file.
+
+Matching uses the title, artist and — where available — the track
+duration, so a cover or a remaster of a different length is not picked
+by mistake. A recording more than two seconds adrift is rejected.
+
+**Missing lyrics are never a failure.** A track with none, an
+instrumental, or an LRCLIB outage all leave the MP3 exactly as
+downloaded and the track still counts as a success. Each run reports
+the outcomes:
 
 ```
-tracks → [resolve ×3] → [saveid3 ×3] → [download ×4] → results
+Lyrics
+  none           14
+  synced         22
+```
+
+| Status | Meaning |
+|---|---|
+| `synced` | timed lyrics found and embedded |
+| `none` | LRCLIB has no synced lyrics for this recording |
+| `cached` | the file already had a SYLT frame; no lookup made |
+| `lookup failed` | LRCLIB was unreachable or errored |
+| `embed failed` | the tag could not be edited safely; audio untouched |
+| `off` | `lyrics` setting is false |
+
+Embedding is idempotent: an existing SYLT frame is replaced, not
+appended to, so re-running never accumulates duplicates. Existing tags
+and the audio payload are preserved byte for byte. If a tag uses
+unsynchronisation, an extended header or a footer, the file is left
+strictly alone — a missing lyric is a non-event, a corrupted audio file
+is not.
+
+Lyrics run as a fourth pipeline stage against a different host, so they
+add no load to the download service.
+
+## How it works
+
+Four independently bounded stages, connected by channels:
+
+```
+tracks → [resolve ×3] → [saveid3 ×3] → [download ×4] → [lyrics ×4] → results
 ```
 
 Each stage has its own worker pool, so a slow 7 MiB download does not

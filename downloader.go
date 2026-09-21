@@ -140,6 +140,13 @@ func (d *Downloader) NewCompletedIndex() *CompletedIndex {
 			continue
 		}
 
+		// Leftover transcode scratch from an interrupted run.
+		if strings.HasSuffix(name, ".src") {
+			_ = os.Remove(filepath.Join(d.dir(), name))
+
+			continue
+		}
+
 		stem := stemOf(name)
 
 		index.exact[stem] = true
@@ -338,7 +345,7 @@ func (d *Downloader) DownloadSaved(
 // extensionFor picks the output extension. The remote name decides it;
 // the rest of the local name comes from the track.
 func (d *Downloader) extensionFor(filename, downloadURL string) string {
-	ext := strings.ToLower(filepath.Ext(filename))
+	ext := cleanExtension(filepath.Ext(filename))
 
 	if ext == "" {
 		ext = extensionFromURL(downloadURL)
@@ -351,10 +358,91 @@ func (d *Downloader) extensionFor(filename, downloadURL string) string {
 	return ext
 }
 
+// SavedPath is where the service-supplied file lands.
+func (d *Downloader) SavedPath(filename string, plan outputPlan) string {
+	return plan.FinalPath(d.extensionFor(filename, ""))
+}
+
 // DiscardPartial removes the partial transfer for a track. Called once
 // the retry budget is spent, so a give-up leaves nothing behind.
 func (d *Downloader) DiscardPartial(filename string, plan outputPlan) {
 	_ = os.Remove(plan.PartPath(d.extensionFor(filename, "")))
+	_ = os.Remove(plan.FinalPath(".mp3") + ".part")
+}
+
+// DiscardScratch removes the intermediate files the transcode path
+// leaves between attempts.
+func (d *Downloader) DiscardScratch(plan outputPlan) {
+	for _, path := range []string{
+		plan.FinalPath(".m4a") + ".src",
+		plan.FinalPath(".m4a") + ".src.part",
+		plan.FinalPath(".jpg") + ".src",
+		plan.FinalPath(".mp3") + ".part",
+	} {
+		_ = os.Remove(path)
+	}
+}
+
+// FetchToFile downloads a small resource, such as cover art, to path.
+// Failure is reported but is never fatal to a track.
+func (d *Downloader) FetchToFile(
+	ctx context.Context,
+	rawURL string,
+	path string,
+) error {
+
+	if strings.TrimSpace(rawURL) == "" {
+		return fmt.Errorf("no URL")
+	}
+
+	handle, err := d.Session.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("User-Agent", browserUserAgent)
+	req.Header.Set("Accept", "image/*,*/*")
+
+	resp, err := handle.Client().Do(req)
+	if err != nil {
+		return err
+	}
+
+	defer drainAndClose(resp)
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+
+	_, copyErr := io.Copy(file, io.LimitReader(resp.Body, 16<<20))
+
+	closeErr := file.Close()
+
+	if copyErr == nil {
+		copyErr = closeErr
+	}
+
+	if copyErr != nil {
+		_ = os.Remove(path)
+
+		return copyErr
+	}
+
+	return nil
 }
 
 // Download streams mediaURL to disk.
@@ -370,6 +458,27 @@ func (d *Downloader) Download(
 	ext string,
 ) (int64, error) {
 
+	return d.DownloadToPath(
+		ctx,
+		track,
+		mediaURL,
+		plan.FinalPath(ext),
+		plan.Stem,
+	)
+}
+
+// DownloadToPath streams mediaURL to destPath, resuming a partial from
+// an earlier attempt where the server supports it.
+//
+// label is what the progress display shows.
+func (d *Downloader) DownloadToPath(
+	ctx context.Context,
+	track Track,
+	mediaURL string,
+	destPath string,
+	label string,
+) (int64, error) {
+
 	if mediaURL == "" {
 		return 0, permanent(fmt.Errorf("media URL is empty"))
 	}
@@ -383,15 +492,15 @@ func (d *Downloader) Download(
 		return 0, fmt.Errorf("establish session: %w", err)
 	}
 
-	if err := os.MkdirAll(plan.Dir, 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
 		return 0, fmt.Errorf(
 			"create output directory: %w",
 			err,
 		)
 	}
 
-	finalPath := plan.FinalPath(ext)
-	partPath := plan.PartPath(ext)
+	finalPath := destPath
+	partPath := destPath + ".part"
 
 	// A partial transfer left by an earlier attempt in this run is
 	// resumed rather than refetched. Partials never survive between
@@ -474,7 +583,7 @@ func (d *Downloader) Download(
 		}
 
 		d.Log.Printf(
-			"[MP3 %02d] resuming at %s\n",
+			"[DL %02d] resuming at %s\n",
 			track.Index+1,
 			formatBytes(resumeFrom),
 		)
@@ -486,7 +595,7 @@ func (d *Downloader) Download(
 
 		return 0, fmt.Errorf(
 			"stale partial discarded for %s; will refetch",
-			plan.Stem,
+			label,
 		)
 
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
@@ -524,7 +633,7 @@ func (d *Downloader) Download(
 	if d.Progress != nil {
 		d.Progress.Start(
 			track.Index,
-			plan.Stem,
+			label,
 			expectedTotal,
 		)
 	}

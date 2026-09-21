@@ -184,17 +184,26 @@ func FetchAppleMusicSong(
 		)
 	}
 
-	// A single-song page carries no tertiaryLinks on the song itself;
-	// the containing album is a sibling item on the page instead.
-	// Without this the ID3 album tag was always "Unknown Album".
-	if album == "" {
-		album = findAppleMusicAlbumTitle(root)
-	}
-
 	thumb := item.Artwork.Dictionary.URL
 
 	if thumb == "" {
 		thumb = item.Artwork.URL
+	}
+
+	// A single-song page carries neither the album name nor artwork on
+	// the song item; both live on the containing album. Without this
+	// the ID3 album tag was always "Unknown Album" and the file got no
+	// cover art at all.
+	if album == "" || thumb == "" {
+		albumTitle, albumArt := findAppleMusicAlbumInfo(root)
+
+		if album == "" {
+			album = albumTitle
+		}
+
+		if thumb == "" {
+			thumb = albumArt
+		}
 	}
 
 	if thumb != "" {
@@ -520,42 +529,89 @@ func findAppleMusicSong(
 	return appleMusicSongItem{}, false
 }
 
-// findAppleMusicAlbumTitle returns the title of the album item on the
-// page, which is how a single-song page names the album the track
-// belongs to.
-func findAppleMusicAlbumTitle(value interface{}) string {
+// findAppleMusicAlbumInfo returns the title and artwork of the album a
+// song belongs to.
+//
+// A single-song page carries neither on the song item itself; both live
+// on the containing album, which is the first album item on the page.
+//
+// Sections and items are walked in document order rather than by
+// ranging over the decoded maps: Go randomises map iteration, and the
+// page lists several unrelated albums further down, so a map walk could
+// return a different album on each run.
+func findAppleMusicAlbumInfo(
+	root map[string]interface{},
+) (title string, artwork string) {
 
-	switch current := value.(type) {
+	entries, _ := root["data"].([]interface{})
 
-	case map[string]interface{}:
+	for _, entry := range entries {
 
-		if getNestedString(
-			current,
-			"contentDescriptor",
-			"kind",
-		) == "album" {
-
-			if title := getString(current, "title"); title != "" {
-				return title
-			}
+		object, ok := entry.(map[string]interface{})
+		if !ok {
+			continue
 		}
 
-		for _, child := range current {
-			if title := findAppleMusicAlbumTitle(child); title != "" {
-				return title
-			}
+		inner, ok := object["data"].(map[string]interface{})
+		if !ok {
+			continue
 		}
 
-	case []interface{}:
+		sections, ok := inner["sections"].([]interface{})
+		if !ok {
+			continue
+		}
 
-		for _, child := range current {
-			if title := findAppleMusicAlbumTitle(child); title != "" {
-				return title
+		for _, section := range sections {
+
+			sectionObject, ok := section.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			items, ok := sectionObject["items"].([]interface{})
+			if !ok {
+				continue
+			}
+
+			for _, item := range items {
+
+				itemObject, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				if getNestedString(
+					itemObject,
+					"contentDescriptor",
+					"kind",
+				) != "album" {
+					continue
+				}
+
+				name := getString(itemObject, "title")
+
+				// Later sections hold related albums with no title.
+				// The containing album is the first titled one.
+				if name == "" {
+					continue
+				}
+
+				art := getNestedString(
+					itemObject, "artwork", "dictionary", "url")
+
+				if art == "" {
+					art = getNestedString(itemObject, "artwork", "url")
+				}
+
+				// Both come from the same album, so the artwork can
+				// never belong to a different record than the name.
+				return name, art
 			}
 		}
 	}
 
-	return ""
+	return "", ""
 }
 
 func convertSongItem(

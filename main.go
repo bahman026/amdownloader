@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -30,6 +31,7 @@ const (
 	resolveTimeout  = 2 * time.Minute
 	saveTimeout     = 5 * time.Minute
 	downloadTimeout = 30 * time.Minute
+	lyricsTimeout   = 30 * time.Second
 )
 
 // Stage concurrency.
@@ -397,13 +399,46 @@ func processTracks(
 		DisableLegacyDetection: !appSettings.DetectLegacyNames,
 	}
 
+	// Lyrics come from LRCLIB, a different host, so they share the
+	// transport but not the session.
+	var lyrics *LyricsProvider
+
+	if appSettings.Lyrics {
+		lyrics = &LyricsProvider{
+			Client:   client,
+			Log:      log,
+			Language: appSettings.LyricsLanguage,
+		}
+	}
+
+	// Local encoding is checked before a single request is made, so a
+	// missing ffmpeg fails immediately rather than after downloading
+	// hundreds of tracks.
+	var transcoder *Transcoder
+
+	if appSettings.AudioMode == audioModeTranscode {
+		transcoder = &Transcoder{
+			Bitrate: appSettings.TranscodeBitrate,
+			Path:    appSettings.FFmpegPath,
+		}
+
+		if err := transcoder.Available(); err != nil {
+			fmt.Printf("ERROR: %v\n", err)
+
+			return
+		}
+	}
+
 	processor := &Processor{
 		ResolveConcurrency:  appSettings.ResolveConcurrency,
 		SaveConcurrency:     appSettings.SaveConcurrency,
 		DownloadConcurrency: appSettings.DownloadConcurrency,
 
-		Quality:             appSettings.Quality,
 		DisableSkipExisting: !appSettings.SkipExisting,
+		LyricsConcurrency:   appSettings.LyricsConcurrency,
+		Lyrics:              lyrics,
+		AudioMode:           appSettings.AudioMode,
+		Transcoder:          transcoder,
 
 		Resolver:   resolver,
 		Downloader: downloader,
@@ -435,12 +470,25 @@ func processTracks(
 	fmt.Printf("Download directory: %s\n", downloadDir)
 
 	fmt.Printf(
-		"Concurrency: resolve=%d save=%d download=%d   Quality: %d\n",
+		"Concurrency: resolve=%d save=%d download=%d lyrics=%d\n",
 		processor.ResolveConcurrency,
 		processor.SaveConcurrency,
 		processor.DownloadConcurrency,
-		processor.Quality,
+		processor.LyricsConcurrency,
 	)
+
+	if transcoder != nil {
+		fmt.Printf(
+			"Audio: local encode at %d kbps from the AAC source (ffmpeg: %s)\n",
+			transcoder.bitrate(),
+			transcoder.Path,
+		)
+	} else {
+		fmt.Println(
+			"Audio: service MP3 (fixed 128 kbps). " +
+				"Set audio_mode=transcode for higher quality.",
+		)
+	}
 
 	fmt.Println()
 
@@ -515,6 +563,8 @@ func printResults(
 	failed := 0
 	skipped := 0
 
+	lyricOutcomes := map[string]int{}
+
 	var bytes int64
 
 	for _, result := range results {
@@ -542,6 +592,10 @@ func printResults(
 		success++
 		bytes += result.Bytes
 
+		if result.Lyrics != "" {
+			lyricOutcomes[result.Lyrics]++
+		}
+
 		fmt.Printf(
 			"[SUCCESS %02d] %s - %s\n",
 			result.Track.Index+1,
@@ -559,6 +613,15 @@ func printResults(
 	fmt.Printf("Downloaded:  %s\n", formatBytes(bytes))
 	fmt.Printf("Time:        %s\n", time.Since(start).Round(time.Millisecond))
 
+	if len(lyricOutcomes) > 0 {
+		fmt.Println()
+		fmt.Println("Lyrics")
+
+		for _, key := range sortedKeys(lyricOutcomes) {
+			fmt.Printf("  %-14s %d\n", key, lyricOutcomes[key])
+		}
+	}
+
 	if processor == nil {
 		return
 	}
@@ -571,6 +634,7 @@ func printResults(
 	printStage("resolve ", &processor.ResolveStats)
 	printStage("saveid3 ", &processor.SaveStats)
 	printStage("download", &processor.DownloadStats)
+	printStage("lyrics  ", &processor.LyricsStats)
 
 	if session == nil {
 		return
@@ -587,6 +651,18 @@ func printResults(
 			observedLimit,
 		)
 	}
+}
+
+func sortedKeys(counts map[string]int) []string {
+	keys := make([]string, 0, len(counts))
+
+	for key := range counts {
+		keys = append(keys, key)
+	}
+
+	sort.Strings(keys)
+
+	return keys
 }
 
 func printStage(name string, stats *StageStats) {

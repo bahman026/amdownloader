@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,6 +14,11 @@ type ProcessResult struct {
 	Error   error
 	Skipped bool
 	Bytes   int64
+
+	// Lyrics records what the lyrics stage did: "synced", "none",
+	// "cached", "off", or a short failure note. It never affects
+	// whether the track counts as a success.
+	Lyrics string
 }
 
 // StageStats accumulates timings so the concurrency of each stage can be
@@ -48,10 +55,16 @@ func (s *StageStats) Snapshot() (count int, avg, max time.Duration) {
 
 // pipelineItem carries one track through the stages.
 type pipelineItem struct {
-	track Track
-	plan  outputPlan
-	dlink string
-	saved string
+	track   Track
+	plan    outputPlan
+	dlink   string
+	saved   string
+	written int64
+
+	// finalPath is set by the download stage to the file it actually
+	// wrote. The lyrics stage uses it directly rather than working the
+	// name out a second time, which is how the two came to disagree.
+	finalPath string
 }
 
 // Processor runs tracks through resolve, metadata and download as three
@@ -69,13 +82,19 @@ type Processor struct {
 	SaveConcurrency     int
 	DownloadConcurrency int
 
-	// Quality is the bitrate requested from the resolver.
-	Quality int
-
 	// DisableSkipExisting processes every track even if its file is
 	// already on disk. Inverted so the zero value keeps skipping on,
 	// which is the useful default.
 	DisableSkipExisting bool
+
+	// LyricsConcurrency and Lyrics control the optional final stage.
+	LyricsConcurrency int
+	Lyrics            *LyricsProvider
+
+	// AudioMode selects the service's 128 kbps MP3 or a local encode
+	// of the higher quality AAC source.
+	AudioMode  string
+	Transcoder *Transcoder
 
 	Resolver   MediaResolver
 	Downloader *Downloader
@@ -89,6 +108,7 @@ type Processor struct {
 	ResolveStats  StageStats
 	SaveStats     StageStats
 	DownloadStats StageStats
+	LyricsStats   StageStats
 
 	SkippedCount int
 }
@@ -106,16 +126,6 @@ func (p *Processor) alreadyDownloaded(
 	}
 
 	return completed.Claim(track, plan)
-}
-
-// quality falls back to the default bitrate when unset, so a Processor
-// built without settings still behaves as before.
-func (p *Processor) quality() int {
-	if p.Quality <= 0 {
-		return 128
-	}
-
-	return p.Quality
 }
 
 func clampConcurrency(value, fallback int) int {
@@ -158,6 +168,7 @@ func (p *Processor) Process(
 	toResolve := make(chan pipelineItem, len(tracks))
 	toSave := make(chan pipelineItem, len(tracks))
 	toDownload := make(chan pipelineItem, len(tracks))
+	toLyrics := make(chan pipelineItem, len(tracks))
 	results := make(chan ProcessResult, len(tracks))
 
 	// Anything already on disk is settled before a single request is
@@ -193,7 +204,9 @@ func (p *Processor) Process(
 
 	close(toResolve)
 
-	var resolveWG, saveWG, downloadWG sync.WaitGroup
+	lyricsN := clampConcurrency(p.LyricsConcurrency, 4)
+
+	var resolveWG, saveWG, downloadWG, lyricsWG sync.WaitGroup
 
 	// ----------------------------------------
 	// Stage 1: resolve
@@ -262,12 +275,45 @@ func (p *Processor) Process(
 			defer downloadWG.Done()
 
 			for item := range toDownload {
-				written, err := p.download(ctx, item)
+				written, path, err := p.download(ctx, item)
 
+				item.finalPath = path
+
+				if err != nil {
+					results <- ProcessResult{
+						Track: item.track,
+						Error: err,
+						Bytes: written,
+					}
+
+					continue
+				}
+
+				item.written = written
+				toLyrics <- item
+			}
+		}()
+	}
+
+	// ----------------------------------------
+	// Stage 4: lyrics
+	//
+	// Runs against a different host, so it adds no load to the
+	// download service. A track that has no lyrics, or whose lookup
+	// fails, is still a successful download.
+	// ----------------------------------------
+
+	for i := 0; i < lyricsN; i++ {
+		lyricsWG.Add(1)
+
+		go func() {
+			defer lyricsWG.Done()
+
+			for item := range toLyrics {
 				results <- ProcessResult{
-					Track: item.track,
-					Error: err,
-					Bytes: written,
+					Track:  item.track,
+					Bytes:  item.written,
+					Lyrics: p.attachLyrics(ctx, item),
 				}
 			}
 		}()
@@ -281,6 +327,9 @@ func (p *Processor) Process(
 		close(toDownload)
 
 		downloadWG.Wait()
+		close(toLyrics)
+
+		lyricsWG.Wait()
 		close(results)
 	}()
 
@@ -329,7 +378,12 @@ func (p *Processor) resolve(
 					SongName: track.Name,
 					Artist:   track.Artist,
 					URL:      track.Link,
-					Quality:  p.quality(),
+					// The service ignores this. It hands back a
+					// fixed .m4a whatever is asked for, and the
+					// MP3 is produced by saveid3.php, which takes
+					// no bitrate at all. 128 is what the site's
+					// own client sends.
+					Quality: 128,
 				},
 			)
 
@@ -370,10 +424,21 @@ func (p *Processor) resolve(
 	return dlink, nil
 }
 
+func (p *Processor) transcoding() bool {
+	return p.AudioMode == audioModeTranscode && p.Transcoder != nil
+}
+
 func (p *Processor) saveID3(
 	ctx context.Context,
 	item pipelineItem,
 ) (string, error) {
+
+	// In transcode mode the service's MP3 is never built: the source
+	// AAC is encoded locally instead, so this whole stage, and the
+	// server-side transcode behind it, is skipped.
+	if p.transcoding() {
+		return "", nil
+	}
 
 	var saved string
 
@@ -433,9 +498,17 @@ func (p *Processor) saveID3(
 func (p *Processor) download(
 	ctx context.Context,
 	item pipelineItem,
-) (int64, error) {
+) (int64, string, error) {
 
 	var written int64
+
+	// Known up front in both modes, so the lyrics stage never has to
+	// guess at the extension.
+	finalPath := item.plan.FinalPath(".mp3")
+
+	if !p.transcoding() {
+		finalPath = p.Downloader.SavedPath(item.saved, item.plan)
+	}
 
 	err := retryOperation(
 		ctx,
@@ -459,12 +532,19 @@ func (p *Processor) download(
 
 			start := time.Now()
 
-			n, err := p.Downloader.DownloadSaved(
-				attemptCtx,
-				item.track,
-				item.saved,
-				item.plan,
-			)
+			var n int64
+			var err error
+
+			if p.transcoding() {
+				n, err = p.downloadAndEncode(attemptCtx, item)
+			} else {
+				n, err = p.Downloader.DownloadSaved(
+					attemptCtx,
+					item.track,
+					item.saved,
+					item.plan,
+				)
+			}
 
 			p.DownloadStats.Observe(time.Since(start))
 
@@ -479,12 +559,13 @@ func (p *Processor) download(
 	)
 
 	if err != nil {
-		// The retry budget is spent, so the partial transfer is no
-		// longer useful. Removing it here is what keeps a failed
-		// download from leaving anything behind.
+		// The retry budget is spent, so the partial transfer and any
+		// transcode scratch are no longer useful. Removing them here
+		// is what keeps a failed download from leaving debris.
 		p.Downloader.DiscardPartial(item.saved, item.plan)
+		p.Downloader.DiscardScratch(item.plan)
 
-		return written, fmt.Errorf("download generated MP3: %w", err)
+		return written, finalPath, fmt.Errorf("download generated MP3: %w", err)
 	}
 
 	p.Log.Printf(
@@ -494,5 +575,158 @@ func (p *Processor) download(
 		formatBytes(written),
 	)
 
-	return written, nil
+	return written, finalPath, nil
+}
+
+// attachLyrics looks up timed lyrics and embeds them in the finished
+// file. It returns a short status and never an error: a track without
+// lyrics is a completed track.
+func (p *Processor) attachLyrics(
+	ctx context.Context,
+	item pipelineItem,
+) string {
+
+	if p.Lyrics == nil {
+		return "off"
+	}
+
+	path := item.finalPath
+
+	if path == "" {
+		return "no file"
+	}
+
+	if HasSyncedLyrics(path) {
+		return "cached"
+	}
+
+	start := time.Now()
+
+	attemptCtx, cancel := context.WithTimeout(ctx, lyricsTimeout)
+	defer cancel()
+
+	lyrics, err := p.Lyrics.Fetch(attemptCtx, item.track)
+
+	p.LyricsStats.Observe(time.Since(start))
+
+	if err != nil {
+		p.Log.Printf(
+			"[LYRICS %02d] lookup failed: %v\n",
+			item.track.Index+1,
+			err,
+		)
+
+		return "lookup failed"
+	}
+
+	if len(lyrics.Lines) == 0 {
+		return "none"
+	}
+
+	if err := EmbedSyncedLyrics(path, lyrics, p.Lyrics.language()); err != nil {
+		p.Log.Printf(
+			"[LYRICS %02d] could not embed: %v\n",
+			item.track.Index+1,
+			err,
+		)
+
+		return "embed failed"
+	}
+
+	p.Log.Printf(
+		"[LYRICS %02d] embedded %d lines: %s\n",
+		item.track.Index+1,
+		len(lyrics.Lines),
+		item.track.Name,
+	)
+
+	return "synced"
+}
+
+// downloadAndEncode fetches the AAC source and encodes it locally.
+//
+// This replaces both the remote transcode and the remote download: the
+// file the service would have built at 128 kbps is never requested.
+func (p *Processor) downloadAndEncode(
+	ctx context.Context,
+	item pipelineItem,
+) (int64, error) {
+
+	plan := item.plan
+
+	finalPath := plan.FinalPath(".mp3")
+	sourcePath := plan.FinalPath(".m4a") + ".src"
+	coverPath := plan.FinalPath(".jpg") + ".src"
+	outputPath := finalPath + ".part"
+
+	// A source fetched by an earlier attempt is reused. Re-encoding is
+	// cheap; re-downloading nine megabytes because ffmpeg failed is
+	// not. Whoever gives up clears the scratch files.
+	if info, err := os.Stat(sourcePath); err != nil || info.Size() == 0 {
+		if _, err := p.Downloader.DownloadToPath(
+			ctx,
+			item.track,
+			item.dlink,
+			sourcePath,
+			plan.Stem,
+		); err != nil {
+			return 0, err
+		}
+	} else {
+		p.Log.Printf(
+			"[DL %02d] reusing source from the previous attempt (%s)\n",
+			item.track.Index+1,
+			formatBytes(info.Size()),
+		)
+	}
+
+	// Artwork is best effort: a track without a cover is still a
+	// track, so a failure here only costs the image.
+	if err := p.Downloader.FetchToFile(
+		ctx,
+		item.track.Thumb,
+		coverPath,
+	); err != nil {
+		p.Log.Printf(
+			"[ART %02d] no cover art (%v)\n",
+			item.track.Index+1,
+			err,
+		)
+
+		coverPath = ""
+	}
+
+	if err := p.Transcoder.ToMP3(
+		ctx,
+		sourcePath,
+		outputPath,
+		item.track,
+		coverPath,
+	); err != nil {
+		_ = os.Remove(outputPath)
+
+		// A missing encoder will not fix itself on a retry.
+		if strings.Contains(err.Error(), "not found on PATH") {
+			return 0, permanent(err)
+		}
+
+		return 0, err
+	}
+
+	if err := os.Rename(outputPath, finalPath); err != nil {
+		_ = os.Remove(outputPath)
+
+		return 0, fmt.Errorf("publish encoded file: %w", err)
+	}
+
+	// Only now that the file is published is the scratch disposable.
+	_ = os.Remove(sourcePath)
+	_ = os.Remove(coverPath)
+
+	info, err := os.Stat(finalPath)
+	if err != nil {
+		return 0, err
+	}
+
+	return info.Size(), nil
 }
