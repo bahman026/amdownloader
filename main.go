@@ -141,6 +141,11 @@ func main() {
 			return
 		}
 
+		if isSpotifyURL(input) {
+			runSpotify(input)
+			return
+		}
+
 		// A link that matched neither is a link that is wrong, not a
 		// phrase to go looking for. Searching for it would bury the
 		// mistake under a list of unrelated songs.
@@ -191,6 +196,7 @@ func printUsage() {
 	fmt.Println("  media-cli <apple-music-playlist-url>   download a playlist")
 	fmt.Println("  media-cli <apple-music-album-url>      download a whole album")
 	fmt.Println("  media-cli <apple-music-song-url>       download one song")
+	fmt.Println("  media-cli <spotify-url>                match on Apple Music, download")
 	fmt.Println("  media-cli                              replay ./album_details")
 	fmt.Println("  media-cli settings                     show or change settings")
 	fmt.Println("  media-cli archive                      inspect what has been downloaded")
@@ -201,6 +207,9 @@ func printUsage() {
 	fmt.Println("that would otherwise read as a command.")
 	fmt.Println()
 	fmt.Println("A song URL is an /album/ URL containing ?i=<track id>.")
+	fmt.Println()
+	fmt.Println("A Spotify link is not downloaded from Spotify: it says which")
+	fmt.Println("songs are wanted, and each is matched against Apple Music.")
 	fmt.Println()
 	fmt.Println("Every finished track is recorded in the archive and is never")
 	fmt.Println("downloaded twice, so re-running a playlist fetches only what")

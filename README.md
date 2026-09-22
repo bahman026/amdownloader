@@ -21,7 +21,7 @@ go run . <args>
 
 ---
 
-## The five modes
+## The six modes
 
 The mode is chosen from the argument shape. Quote URLs — they contain
 `?` and `&`.
@@ -191,7 +191,54 @@ reported as a bad link rather than quietly searched for.
 - Writes `./album_details`
 - Downloads directly into `./downloads/` (no subfolder)
 
-### 5. Replay from `album_details`
+### 5. Spotify link
+
+```bash
+./media-cli "https://open.spotify.com/track/4PTG3Z6ehGkBFwjybzWkR8"
+./media-cli "https://open.spotify.com/album/6N9PS4QXF1D0OWPk0Sxtb4"
+./media-cli "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
+```
+
+**Nothing is downloaded from Spotify, and nothing could be** — its audio
+is encrypted and its API needs credentials. What a share link does give,
+to anyone, is *which songs are meant*: titles, artists and durations,
+read from the player page behind the link. Each one is then matched
+against the Apple Music catalogue and downloaded from there.
+
+So a Spotify link is a way of naming songs, not a source of them.
+
+```
+Spotify album: Whenever You Need Somebody (10 track(s))
+Spotify itself is not the source: each track is matched against the
+Apple Music catalogue and downloaded from there.
+
+[  1/10] Never Gonna Give You Up - Rick Astley ... Never Gonna Give You Up - Rick Astley
+[  2/10] Whenever You Need Somebody - Rick Astley ... Whenever You Need Somebody - Rick Astley
+...
+```
+
+Matching scores three things and takes the best total, refusing anything
+below a floor rather than guessing:
+
+| | |
+|---|---|
+| Title | equal, or one the start of the other, or one inside the other |
+| Artist | a word of the name starting with it; **a different artist is rejected outright** |
+| Duration | within 2s, within 5s, and **more than 20s apart is rejected** |
+
+Duration matters because a title and an artist alone will also match a
+live take, an extended mix or a sped-up edit. Anything that matched is
+listed for you to pick from, and anything that did not is listed
+separately as not found — never silently substituted.
+
+The `intl-xx/` links the desktop app copies work, as do `spotify:` URIs.
+Lookups are spaced ~0.6s apart because Apple rate-limits search, so a
+50-track playlist takes about half a minute to resolve.
+
+A track goes into `./downloads/`; an album or playlist keeps its name as
+the folder, the same as every other mode.
+
+### 6. Replay from `album_details`
 
 ```bash
 ./media-cli
@@ -442,6 +489,9 @@ against the service.
 | `MEDIA_CLI_ARCHIVE_FILE` | `./downloaded.json` | record of finished tracks |
 | `MEDIA_CLI_SEARCH_COUNTRY` | `us` | storefront to search |
 | `MEDIA_CLI_SEARCH_LIMIT` | `20` | results offered per search |
+
+Spotify matching uses `search_country` too: the storefront it looks for
+matches in is the one that is searched.
 | `MEDIA_CLI_LYRICS_CONCURRENCY` | `4` | parallel lyrics lookups |
 
 ```bash

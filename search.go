@@ -274,6 +274,11 @@ type SearchResult struct {
 	Year     string
 	Explicit bool
 
+	// Millis is the track length as the catalogue states it. It is what
+	// tells two recordings of one title apart when a Spotify link is
+	// being matched against this catalogue.
+	Millis int64
+
 	// AlbumID and TrackCount carry an album result: the id is how its
 	// tracks are looked up, the count is what the listing shows.
 	AlbumID    int64
@@ -843,6 +848,7 @@ func songResult(item itunesTrack) (SearchResult, bool) {
 		Artist:   strings.TrimSpace(item.ArtistName),
 		Album:    strings.TrimSpace(item.CollectionName),
 		Duration: formatAppleMusicDuration(item.TrackTimeMillis),
+		Millis:   int64(item.TrackTimeMillis),
 		Link:     link,
 		Thumb:    searchArtworkURL(item.ArtworkURL100),
 		Year:     releaseYear(item.ReleaseDate),
