@@ -110,17 +110,21 @@ func main() {
 			runSettings(os.Args[2:])
 			return
 
+		case "archive", "downloaded":
+			runArchive(os.Args[2:])
+			return
+
+		case "search", "find":
+			loadAppSettings()
+			runSearch(strings.Join(os.Args[2:], " "))
+			return
+
 		case "help", "-h", "--help":
 			printUsage()
 			return
 		}
 
-		settings, notes := LoadSettings()
-		appSettings = settings
-
-		for _, note := range notes {
-			fmt.Println(note)
-		}
+		loadAppSettings()
 
 		if isAppleMusicPlaylistURL(input) {
 			runPlaylist(input)
@@ -132,33 +136,75 @@ func main() {
 			return
 		}
 
-		fmt.Printf("Unrecognised argument: %s\n\n", input)
-		printUsage()
+		if isAppleMusicAlbumURL(input) {
+			runAlbumLink(input)
+			return
+		}
+
+		// A link that matched neither is a link that is wrong, not a
+		// phrase to go looking for. Searching for it would bury the
+		// mistake under a list of unrelated songs.
+		if looksLikeLink(input) {
+			fmt.Printf("Unrecognised link: %s\n\n", input)
+			printUsage()
+
+			return
+		}
+
+		// Anything else is what the user is looking for.
+		runSearch(strings.Join(os.Args[1:], " "))
 
 		return
 	}
 
+	loadAppSettings()
+
+	runAlbumDetails()
+}
+
+// loadAppSettings resolves the configuration for this run and reports
+// anything it had to correct.
+func loadAppSettings() {
 	settings, notes := LoadSettings()
+
 	appSettings = settings
 
 	for _, note := range notes {
 		fmt.Println(note)
 	}
+}
 
-	runAlbumDetails()
+// looksLikeLink reports whether the argument was meant to be a URL.
+func looksLikeLink(value string) bool {
+	value = strings.TrimSpace(strings.ToLower(value))
+
+	return strings.HasPrefix(value, "http://") ||
+		strings.HasPrefix(value, "https://") ||
+		strings.Contains(value, "music.apple.com")
 }
 
 func printUsage() {
 	fmt.Println("media-cli")
 	fmt.Println()
 	fmt.Println("Usage:")
+	fmt.Println("  media-cli \"song name artist\"           search, then pick what to download")
 	fmt.Println("  media-cli <apple-music-playlist-url>   download a playlist")
+	fmt.Println("  media-cli <apple-music-album-url>      download a whole album")
 	fmt.Println("  media-cli <apple-music-song-url>       download one song")
 	fmt.Println("  media-cli                              replay ./album_details")
 	fmt.Println("  media-cli settings                     show or change settings")
+	fmt.Println("  media-cli archive                      inspect what has been downloaded")
 	fmt.Println("  media-cli help                         this message")
 	fmt.Println()
+	fmt.Println("Any argument that is not a link and not a command is searched")
+	fmt.Println("for on Apple Music; use `media-cli search <words>` for a query")
+	fmt.Println("that would otherwise read as a command.")
+	fmt.Println()
 	fmt.Println("A song URL is an /album/ URL containing ?i=<track id>.")
+	fmt.Println()
+	fmt.Println("Every finished track is recorded in the archive and is never")
+	fmt.Println("downloaded twice, so re-running a playlist fetches only what")
+	fmt.Println("was added to it. See `media-cli archive`.")
 }
 
 func runPlaylist(input string) {
@@ -290,6 +336,64 @@ func runSingleSong(input string) {
 	)
 }
 
+// runAlbumLink downloads every track of a pasted album URL.
+func runAlbumLink(input string) {
+	id := appleMusicAlbumID(input)
+
+	if id == 0 {
+		fmt.Printf("No album id in that link: %s\n\n", input)
+		printUsage()
+
+		return
+	}
+
+	fmt.Println("Fetching Apple Music album...")
+	fmt.Println()
+
+	searcher := newSongSearch()
+
+	// The link names the store it came from, and that store is the one
+	// that has the album.
+	if store := appleMusicStorefront(input); store != "" {
+		searcher.Country = store
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		searchTimeout,
+	)
+	defer cancel()
+
+	tracks, err := searcher.AlbumTracks(ctx, id)
+
+	if err != nil {
+		fmt.Printf("ERROR: %v\n", err)
+
+		return
+	}
+
+	album := strings.TrimSpace(tracks[0].Album)
+
+	if album == "" {
+		album = "Unknown Album"
+	}
+
+	fmt.Printf("Album:  %s\n", album)
+	fmt.Printf("Artist: %s\n", tracks[0].Artist)
+	fmt.Printf("Tracks: %d\n", len(tracks))
+	fmt.Println()
+
+	downloadTracks(
+		tracks,
+		filepath.Join(
+			appSettings.OutputDir,
+			safeFilename(album),
+		),
+		album,
+		"",
+	)
+}
+
 func runAlbumDetails() {
 	input, err := os.ReadFile(
 		"album_details",
@@ -375,6 +479,23 @@ func processTracks(
 	log := NewLogger(os.Stdout)
 	defer log.Close()
 
+	// Loaded before the pipeline starts, so tracks already recorded are
+	// settled without a single request. A failure here is reported and
+	// the run continues: not knowing what was downloaded before costs
+	// bandwidth, not correctness.
+	var archive *Archive
+
+	if appSettings.Archive {
+		loaded, err := LoadArchive(appSettings.ArchiveFile)
+
+		if err != nil {
+			fmt.Printf("WARNING: %v\n", err)
+			fmt.Println("Continuing without the download archive.")
+		} else {
+			archive = loaded
+		}
+	}
+
 	progress := NewProgressManager()
 	progress.SetTotal(len(tracks))
 
@@ -442,6 +563,7 @@ func processTracks(
 		DownloadConcurrency: appSettings.DownloadConcurrency,
 
 		DisableSkipExisting: !appSettings.SkipExisting,
+		Archive:             archive,
 		LyricsConcurrency:   appSettings.LyricsConcurrency,
 		Lyrics:              lyrics,
 		AudioMode:           appSettings.AudioMode,
@@ -475,6 +597,26 @@ func processTracks(
 	}
 
 	fmt.Printf("Download directory: %s\n", downloadDir)
+
+	if archive != nil {
+		fmt.Printf(
+			"Archive: %s (%d track(s) already downloaded)\n",
+			archive.Path(),
+			archive.Len(),
+		)
+
+		if archive.Malformed() > 0 {
+			fmt.Printf(
+				"WARNING: %d unreadable line(s) in %s were ignored\n",
+				archive.Malformed(),
+				archive.Path(),
+			)
+		}
+	} else {
+		fmt.Println(
+			"Archive: off (tracks are matched by filename only)",
+		)
+	}
 
 	fmt.Printf(
 		"Concurrency: resolve=%d save=%d download=%d lyrics=%d\n",
@@ -530,6 +672,14 @@ func isAppleMusicPlaylistURL(
 		)
 }
 
+// isAppleMusicAlbumURL matches an /album/ link with no track id on it,
+// which names the whole album.
+func isAppleMusicAlbumURL(value string) bool {
+	return strings.Contains(value, "music.apple.com") &&
+		strings.Contains(value, "/album/") &&
+		!strings.Contains(value, "?i=")
+}
+
 func isAppleMusicSongURL(
 	value string,
 ) bool {
@@ -570,6 +720,8 @@ func printResults(
 	failed := 0
 	skipped := 0
 
+	skipReasons := map[string]int{}
+
 	lyricOutcomes := map[string]int{}
 
 	var bytes int64
@@ -578,6 +730,14 @@ func printResults(
 
 		if result.Skipped {
 			skipped++
+
+			reason := result.SkipReason
+
+			if reason == "" {
+				reason = "already downloaded"
+			}
+
+			skipReasons[reason]++
 
 			continue
 		}
@@ -615,7 +775,7 @@ func printResults(
 
 	fmt.Printf("Total:       %d\n", len(results))
 	fmt.Printf("Success:     %d\n", success)
-	fmt.Printf("Skipped:     %d\n", skipped)
+	fmt.Printf("Skipped:     %d%s\n", skipped, skipDetail(skipReasons))
 	fmt.Printf("Failed:      %d\n", failed)
 	fmt.Printf("Downloaded:  %s\n", formatBytes(bytes))
 	fmt.Printf("Time:        %s\n", time.Since(start).Round(time.Millisecond))
@@ -658,6 +818,22 @@ func printResults(
 			observedLimit,
 		)
 	}
+}
+
+// skipDetail explains a skip count, so "Skipped: 38" says whether those
+// tracks were recognised from the archive or found in the folder.
+func skipDetail(reasons map[string]int) string {
+	if len(reasons) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(reasons))
+
+	for _, key := range sortedKeys(reasons) {
+		parts = append(parts, fmt.Sprintf("%s %d", key, reasons[key]))
+	}
+
+	return "  (" + strings.Join(parts, ", ") + ")"
 }
 
 func sortedKeys(counts map[string]int) []string {

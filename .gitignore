@@ -1,6 +1,9 @@
 /downloads/
 album_details
 
+# Record of what has already been downloaded, per user.
+downloaded.json
+
 # Local configuration, per user.
 settings.json
 

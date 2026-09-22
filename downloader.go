@@ -109,15 +109,18 @@ func (d *Downloader) Plan(track Track) outputPlan {
 // Claim mutates the index, so it is used only from the single-threaded
 // pre-flight pass before any worker starts.
 type CompletedIndex struct {
-	exact        map[string]bool
-	legacy       map[string]int
+	dir string
+
+	exact        map[string]string
+	legacy       map[string][]string
 	detectLegacy bool
 }
 
 func (d *Downloader) NewCompletedIndex() *CompletedIndex {
 	index := &CompletedIndex{
-		exact:        make(map[string]bool),
-		legacy:       make(map[string]int),
+		dir:          d.dir(),
+		exact:        make(map[string]string),
+		legacy:       make(map[string][]string),
 		detectLegacy: !d.DisableLegacyDetection,
 	}
 
@@ -149,8 +152,11 @@ func (d *Downloader) NewCompletedIndex() *CompletedIndex {
 
 		stem := stemOf(name)
 
-		index.exact[stem] = true
-		index.legacy[canonicalKey(stem)]++
+		index.exact[stem] = name
+
+		key := canonicalKey(stem)
+
+		index.legacy[key] = append(index.legacy[key], name)
 	}
 
 	return index
@@ -163,23 +169,38 @@ func (c *CompletedIndex) Claim(
 	plan outputPlan,
 ) (bool, string) {
 
-	if c.exact[plan.Stem] {
-		return true, "current naming"
+	done, how, _ := c.ClaimFile(track, plan)
+
+	return done, how
+}
+
+// ClaimFile is Claim, additionally reporting the path of the file that
+// matched. The archive records that path, so a later `archive prune` can
+// tell whether the file is still there.
+func (c *CompletedIndex) ClaimFile(
+	track Track,
+	plan outputPlan,
+) (bool, string, string) {
+
+	if name, ok := c.exact[plan.Stem]; ok {
+		return true, "current naming", filepath.Join(c.dir, name)
 	}
 
 	if !c.detectLegacy {
-		return false, ""
+		return false, "", ""
 	}
 
 	key := canonicalKey(track.Name + track.Artist)
 
-	if key != "" && c.legacy[key] > 0 {
-		c.legacy[key]--
+	if key != "" && len(c.legacy[key]) > 0 {
+		name := c.legacy[key][0]
 
-		return true, "legacy naming"
+		c.legacy[key] = c.legacy[key][1:]
+
+		return true, "legacy naming", filepath.Join(c.dir, name)
 	}
 
-	return false, ""
+	return false, "", ""
 }
 
 // SaveID3 asks the remote service to build a tagged file and returns the

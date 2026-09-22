@@ -40,6 +40,19 @@ type Settings struct {
 	// naming scheme when deciding what is already downloaded.
 	DetectLegacyNames bool `json:"detect_legacy_names"`
 
+	// Archive records every finished track in ArchiveFile and skips
+	// anything already listed there.
+	//
+	// Unlike SkipExisting, which can only see the folder this run
+	// writes to and the name this run would give the file, the archive
+	// is keyed by the Apple Music track id. It therefore survives a
+	// playlist being reordered, the same song turning up in a second
+	// playlist, and a track already fetched as a single.
+	Archive bool `json:"archive"`
+
+	// ArchiveFile is where that record lives.
+	ArchiveFile string `json:"archive_file"`
+
 	// Lyrics controls whether synchronised lyrics are looked up on
 	// LRCLIB and embedded into each finished MP3.
 	Lyrics bool `json:"lyrics"`
@@ -63,7 +76,20 @@ type Settings struct {
 
 	// FFmpegPath overrides binary discovery. Empty means use PATH.
 	FFmpegPath string `json:"ffmpeg_path"`
+
+	// SearchCountry is the storefront searched when a query is given
+	// instead of a link. Results, and the links behind them, differ
+	// between storefronts.
+	SearchCountry string `json:"search_country"`
+
+	// SearchLimit is how many matches a search offers to choose from.
+	SearchLimit int `json:"search_limit"`
 }
+
+const (
+	defaultSearchCountry = "us"
+	defaultSearchLimit   = 20
+)
 
 const (
 	audioModeService   = "service"
@@ -81,11 +107,15 @@ func DefaultSettings() *Settings {
 		DownloadAttempts:    3,
 		SkipExisting:        true,
 		DetectLegacyNames:   true,
+		Archive:             true,
+		ArchiveFile:         defaultArchiveFile,
 		Lyrics:              true,
 		LyricsLanguage:      "und",
 		LyricsConcurrency:   4,
 		AudioMode:           audioModeService,
 		TranscodeBitrate:    320,
+		SearchCountry:       defaultSearchCountry,
+		SearchLimit:         defaultSearchLimit,
 	}
 }
 
@@ -141,6 +171,21 @@ func LoadSettings() (*Settings, []string) {
 		settings.OutputDir = dir
 	}
 
+	if file := strings.TrimSpace(
+		os.Getenv("MEDIA_CLI_ARCHIVE_FILE"),
+	); file != "" {
+		settings.ArchiveFile = file
+	}
+
+	if country := strings.TrimSpace(
+		os.Getenv("MEDIA_CLI_SEARCH_COUNTRY"),
+	); country != "" {
+		settings.SearchCountry = country
+	}
+
+	settings.SearchLimit = envInt(
+		"MEDIA_CLI_SEARCH_LIMIT", settings.SearchLimit)
+
 	notes = append(notes, settings.normalize()...)
 
 	return settings, notes
@@ -156,6 +201,23 @@ func (s *Settings) normalize() []string {
 
 	if len(s.LyricsLanguage) != 3 {
 		s.LyricsLanguage = "und"
+	}
+
+	if strings.TrimSpace(s.ArchiveFile) == "" {
+		s.ArchiveFile = defaultArchiveFile
+	}
+
+	s.SearchCountry = strings.ToLower(strings.TrimSpace(s.SearchCountry))
+
+	if len(s.SearchCountry) != 2 {
+		if s.SearchCountry != "" {
+			notes = append(notes, fmt.Sprintf(
+				"WARNING: search_country %q is not a 2-letter code; using %s",
+				s.SearchCountry, defaultSearchCountry,
+			))
+		}
+
+		s.SearchCountry = defaultSearchCountry
 	}
 
 	if s.AudioMode != audioModeService && s.AudioMode != audioModeTranscode {
@@ -203,6 +265,7 @@ func (s *Settings) normalize() []string {
 	clamp("resolve_attempts", &s.ResolveAttempts, 1, 10)
 	clamp("save_attempts", &s.SaveAttempts, 1, 10)
 	clamp("download_attempts", &s.DownloadAttempts, 1, 10)
+	clamp("search_limit", &s.SearchLimit, 1, 50)
 
 	return notes
 }
@@ -217,10 +280,21 @@ func (s *Settings) validate() error {
 		return fmt.Errorf("output_dir cannot be empty")
 	}
 
+	if strings.TrimSpace(s.ArchiveFile) == "" {
+		return fmt.Errorf("archive_file cannot be empty")
+	}
+
 	if len(s.LyricsLanguage) != 3 {
 		return fmt.Errorf(
 			"lyrics_language must be a 3-letter code, got %q",
 			s.LyricsLanguage,
+		)
+	}
+
+	if len(strings.TrimSpace(s.SearchCountry)) != 2 {
+		return fmt.Errorf(
+			"search_country must be a 2-letter code such as us, got %q",
+			s.SearchCountry,
 		)
 	}
 
@@ -250,6 +324,7 @@ func (s *Settings) validate() error {
 		{"resolve_attempts", s.ResolveAttempts, 1, 10},
 		{"save_attempts", s.SaveAttempts, 1, 10},
 		{"download_attempts", s.DownloadAttempts, 1, 10},
+		{"search_limit", s.SearchLimit, 1, 50},
 	}
 
 	for _, r := range ranges {
@@ -415,6 +490,23 @@ func settingFields() map[string]field {
 			set:  setBool(func(s *Settings, v bool) { s.SkipExisting = v }),
 			help: "skip tracks already on disk, before any request",
 		},
+		"archive": {
+			get:  func(s *Settings) string { return strconv.FormatBool(s.Archive) },
+			set:  setBool(func(s *Settings, v bool) { s.Archive = v }),
+			help: "record finished tracks and skip anything already recorded",
+		},
+		"archive_file": {
+			get: func(s *Settings) string { return s.ArchiveFile },
+			set: func(s *Settings, raw string) error {
+				raw = strings.TrimSpace(raw)
+				if raw == "" {
+					return fmt.Errorf("archive_file cannot be empty")
+				}
+				s.ArchiveFile = raw
+				return nil
+			},
+			help: "file the record of finished tracks is kept in",
+		},
 		"detect_legacy_names": {
 			get:  func(s *Settings) string { return strconv.FormatBool(s.DetectLegacyNames) },
 			set:  setBool(func(s *Settings, v bool) { s.DetectLegacyNames = v }),
@@ -464,6 +556,24 @@ func settingFields() map[string]field {
 				return nil
 			},
 			help: "path to ffmpeg; empty means look it up on PATH",
+		},
+		"search_country": {
+			get: func(s *Settings) string { return s.SearchCountry },
+			set: func(s *Settings, raw string) error {
+				raw = strings.ToLower(strings.TrimSpace(raw))
+				if len(raw) != 2 {
+					return fmt.Errorf(
+						"expected a 2-letter code such as us, got %q", raw)
+				}
+				s.SearchCountry = raw
+				return nil
+			},
+			help: "storefront searched when a query is given instead of a link",
+		},
+		"search_limit": {
+			get:  func(s *Settings) string { return strconv.Itoa(s.SearchLimit) },
+			set:  setInt(func(s *Settings, v int) { s.SearchLimit = v }),
+			help: "how many search results to offer (1-50)",
 		},
 		"lyrics_concurrency": {
 			get:  func(s *Settings) string { return strconv.Itoa(s.LyricsConcurrency) },
@@ -591,7 +701,7 @@ func (s *Settings) Print(out io.Writer) {
 	for _, name := range sortedFieldNames() {
 		fmt.Fprintf(
 			out,
-			"  %-22s %-12s %s\n",
+			"  %-22s %-16s %s\n",
 			name,
 			fields[name].get(s),
 			fields[name].help,

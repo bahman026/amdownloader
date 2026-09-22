@@ -21,12 +21,135 @@ go run . <args>
 
 ---
 
-## The three modes
+## The five modes
 
 The mode is chosen from the argument shape. Quote URLs — they contain
 `?` and `&`.
 
-### 1. Playlist
+### 1. Search
+
+```bash
+./media-cli "Je suis fan"
+./media-cli Je suis fan            # quotes optional
+./media-cli search settings        # for a query that reads as a command
+```
+
+Anything that is **not a link and not a command** is searched for on
+Apple Music. Tracks and albums come back, you pick, and the picks
+download:
+
+```
+Searching Apple Music (US) for "a star is born soundtrack"...
+
+  #   Type   Title                          Artist                Album / info              Time
+  1   track  Shallow                        Lady Gaga & Bradle... A Star Is Born Soundtrack 3:35
+  2   track  Always Remember Us This Way    Lady Gaga             A Star Is Born Soundtrack 3:30
+  3   track  Maybe It's Time                Bradley Cooper        A Star Is Born Soundtrack 2:39
+
+  4   album  A Star Is Born Soundtrack      Lady Gaga & Bradle... 35 tracks, 2018
+  5   album  A Star Is Born                 Judy Garland          26 tracks, 1954
+
+Pick a number (1-25), several like 1 3 5, a range like 1-3,
+"a" for all, or Enter to cancel.
+> 4
+```
+
+- A pick is a number, several numbers (`1 3 5`), a range (`1-3`), `a`
+  for all, or Enter to cancel
+- **`track`** downloads that one song into `./downloads/`
+- **`album`** looks up every track on it and downloads the lot into
+  `./downloads/<Album Name>/`, in running order
+- An album has to be picked **on its own** — the two go to different
+  places, so one pick cannot be both; picking a mix re-asks
+- Tracks already in the archive are marked, so the copy you already have
+  is obvious among several releases of the same song
+- Explicit tracks are marked `[E]`
+- `./album_details` is written either way, so a bare `./media-cli`
+  replays the pick
+
+Search uses Apple's public catalogue API, which returns the very same
+`?i=<track id>` link you would have pasted — so a search result and a
+pasted link take exactly the same path from there on. Storefronts differ:
+`media-cli settings set search_country fr` searches the French catalogue.
+
+**Playlists cannot be searched.** Apple's public catalogue indexes songs
+and albums only; there is no playlist entity in it. Paste a playlist URL
+instead — that is mode 2. That is also why the `Type` column only ever
+says `track` or `album`.
+
+#### Narrowing by artist
+
+The catalogue needs every word you send it to match the **same** record,
+so adding the artist to the query makes things worse, not better:
+`tanhaeia` finds five songs, `shadmehr` finds plenty, and
+`tanhaeia shadmehr` finds **nothing at all**. Name the artist separately
+instead, and it narrows the results here rather than the search there:
+
+```bash
+./media-cli tanhaeeia /artist shadmehr      # title, narrowed by artist
+./media-cli shallow /album a star is born   # title, narrowed by album
+./media-cli /artist "shadmehr aghili"       # browse an artist
+```
+
+`/artist` takes everything after it until the next marker, so quoting is
+optional. `--artist` and `/by` work too.
+
+A filter is matched loosely — case, punctuation and doubled letters are
+ignored — and in two passes. A word of the name **starting** with what
+you typed wins first, so `/artist shad` means *Shadmehr*, not *Farshad*;
+if nothing matches that way, anywhere in the name counts, so you get the
+Farshads rather than an empty list.
+
+When a filter is given, the search asks the catalogue for a much wider
+set than it shows, because the filter is applied to what comes back.
+
+**If the title search still finds nothing**, an `/artist` filter gives
+one more way in: the artist is looked up, and *their own catalogue* is
+read and matched here. That is what finds a song no spelling of the
+title can reach —
+
+```
+$ ./media-cli tanhaeeia /artist shadmehr
+Searching Apple Music (US) for "tanhaeeia" by artist matching "shadmehr"...
+
+No match for "tanhaeeia" by artist matching "shadmehr"; showing songs by Shadmehr Aghili.
+
+  #   Type   Title                          Artist                Album / info              Time
+  1   track  Tanhaeiam                      Shadmehr Aghili       Tajrobeh Kon              4:04
+```
+
+— because `tanhaeeia` reduces to `tanhaeia`, which is the start of
+`Tanhaeiam`.
+
+The fragment has to be enough for Apple to find the artist, though.
+`/artist shad` does **not** reach Shadmehr Aghili: asked for artists
+named `shad`, Apple returns two hundred acts literally called *Shad* and
+he is not among them. Type more of the name.
+
+#### Near spellings
+
+A name the catalogue stores romanised has no single correct spelling,
+and the catalogue matches loosely but not evenly. `tanhaeeiam` finds
+*Tanhaeiam*; `tanhaeeia` finds nothing at all, though `tanhaeia` finds
+five. So a search that comes back empty is retried against near
+spellings — the doubled letters collapsed first, then the longest word
+cut back — and the one that worked is named:
+
+```
+Searching Apple Music (US) for "tanhaeeia"...
+
+No match for "tanhaeeia"; showing results for "tanhaeia".
+
+  #   Type   Title                          Artist                Album / info              Time
+  1   track  Tanhaei                        Mohsen Yeganeh        Hobab                     5:08
+```
+
+Only a search that found **nothing** falls back, it stops at the first
+spelling that finds something, and it is capped at three extra queries —
+Apple rate-limits this endpoint. If nothing works, the message lists
+what was tried.
+
+### 2. Playlist
 
 ```bash
 ./media-cli "https://music.apple.com/us/playlist/some-name/pl.abc123"
@@ -41,19 +164,34 @@ Matches any `music.apple.com` URL containing `/playlist/`.
 - Duplicate tracks are kept; a playlist may intentionally list the same
   song twice
 
-### 2. Single song
+### 3. Album
+
+```bash
+./media-cli "https://music.apple.com/us/album/drama/1562865138"
+```
+
+An `/album/` URL with **no** `?i=` on it. Every track on the album is
+looked up and downloaded into `./downloads/<Album Name>/`, numbered in
+running order.
+
+The storefront in the link is the one asked, so a `/tr/` link is looked
+up against the Turkish catalogue whatever `search_country` says.
+
+### 4. Single song
 
 ```bash
 ./media-cli "https://music.apple.com/us/album/some-album/123456?i=789012"
 ```
 
-Matches a `music.apple.com` URL containing `/album/` **and** `?i=`. The
-`?i=` track id is required.
+Matches a `music.apple.com` URL containing `/album/` **and** `?i=`. That
+track id is what separates this from mode 3: with it, one song; without
+it, the whole album. A `music.apple.com` link that matches no mode is
+reported as a bad link rather than quietly searched for.
 
 - Writes `./album_details`
 - Downloads directly into `./downloads/` (no subfolder)
 
-### 3. Replay from `album_details`
+### 5. Replay from `album_details`
 
 ```bash
 ./media-cli
@@ -70,12 +208,16 @@ Apple Music page.
 ## Output layout
 
 ```
-./album_details                          manifest from the last fetch
+./album_details                          manifest from the last fetch or search
+./downloaded.json                        every track already downloaded
 ./downloads/
     <Playlist Name>/
         01 - Song Name - Artist.mp3
         02 - Another Song - Artist.mp3
-    Single Song - Artist.mp3             (single-song mode)
+    <Album Name>/                        (album URL, or an album picked
+        01 - Song Name - Artist.mp3       from a search)
+    01 - Single Song - Artist.mp3        (single song, or tracks picked
+                                          from a search)
 ```
 
 Files are named `NN - Name - Artist.ext`. The number is the track's
@@ -108,11 +250,30 @@ truncated file is never renamed into place.
 
 ## Re-running
 
-A track whose final file already exists is skipped **before any network
-request is made**. Re-running a playlist after a partial failure costs
-nothing for the tracks that already succeeded.
+A track that has already been downloaded is skipped **before any network
+request is made**. Re-running a playlist after a partial failure, or
+after new songs were added to it, costs nothing for the tracks that were
+already fetched.
 
-Both naming schemes are recognised:
+Two things recognise a track, in this order.
+
+**1. `./downloaded.json`** — the archive of everything ever downloaded,
+keyed by the Apple Music track id. It answers the cases a folder listing
+cannot:
+
+- the playlist was **reordered**, or a song was added to the top, so
+  every file's `NN -` prefix now points at a different track
+- the same song turns up in a **second playlist**, which downloads into
+  a different folder
+- the track was already fetched on its own, in **single-song mode**
+- the file was **renamed**, or moved somewhere else in the library
+
+**2. The output directory** — for anything the archive has not heard of.
+A file found this way is recorded in the archive on the spot, so an
+existing `./downloads` folder is adopted on the first run and answered
+from the archive thereafter.
+
+Both naming schemes are recognised on disk:
 
 - **Current** — `01 - Song - Artist.mp3`, matched exactly by index, so
   duplicate tracks are each recognised independently.
@@ -133,7 +294,58 @@ previously lost.
 ./media-cli            # second run: 40 skipped, no requests
 ```
 
-To force a re-download, delete the file (or the folder).
+To force a re-download, drop the track from the archive (see below) and
+delete the file.
+
+---
+
+## The download archive
+
+`./downloaded.json` is a plain JSON array, one object per finished track:
+
+```json
+[
+  {
+    "key": "am:1440782870",
+    "name": "Still D.R.E. (feat. Snoop Dogg)",
+    "artist": "Dr. Dre",
+    "album": "2001",
+    "path": "downloads/2001/01 - Still D.R.E. (feat. Snoop Dogg) - Dr. Dre.mp3",
+    "bytes": 6710886,
+    "audio_mode": "transcode",
+    "bitrate": 320,
+    "downloaded_at": "2026-09-21T14:42:00Z"
+  }
+]
+```
+
+`key` is what matching uses: `am:<apple music track id>`, or
+`name:<letters and digits of name+artist>` for the rare entry with no
+id. Everything else is there so the file can be read and edited by hand.
+
+It is written out again each time a track finishes, through a temporary
+file that is renamed into place, so an interrupted run keeps every record
+up to that point and a crash mid-write cannot truncate it.
+
+```bash
+media-cli archive                 how many tracks are recorded
+media-cli archive list            every recorded track
+media-cli archive prune           drop records whose file is gone
+media-cli archive forget rasputin drop records matching a name, artist or id
+media-cli archive clear           drop every record
+media-cli archive path            print the archive file path
+```
+
+A record is kept even when its file is deleted, so a track you removed
+on purpose stays removed. `archive prune` is the opposite choice: it
+drops records whose file is missing, and those tracks download again on
+the next run.
+
+Duplicates are preserved. A playlist that lists one song twice is backed
+by two records, so one record satisfies exactly one entry.
+
+Turn it off with `media-cli settings set archive false`, and matching
+falls back to filenames alone.
 
 ---
 
@@ -158,7 +370,11 @@ media-cli settings path                     # where the file lives
 | `resolve_attempts` | `3` | attempts per track at the resolve stage (1-10) |
 | `save_attempts` | `2` | attempts at MP3 generation (kept low, it transcodes) |
 | `download_attempts` | `3` | attempts per file transfer (1-10) |
-| `skip_existing` | `true` | skip tracks already on disk, before any request |
+| `skip_existing` | `true` | skip tracks already downloaded, before any request |
+| `archive` | `true` | record finished tracks and skip anything already recorded |
+| `archive_file` | `downloaded.json` | file the record of finished tracks is kept in |
+| `search_country` | `us` | storefront searched when a query is given instead of a link |
+| `search_limit` | `20` | how many search results to offer (1-50) |
 | `detect_legacy_names` | `true` | also recognise files saved under the old naming scheme |
 | `audio_mode` | `service` | `service` (128k, remote) or `transcode` (local encode) |
 | `transcode_bitrate` | `320` | kbps for the local encode (128, 192, 256, 320) |
@@ -223,6 +439,9 @@ against the service.
 | `MEDIA_CLI_SAVE_CONCURRENCY` | `3` | server-side MP3 generation |
 | `MEDIA_CLI_DOWNLOAD_CONCURRENCY` | `4` | transfer the generated file |
 | `MEDIA_CLI_OUTPUT_DIR` | `./downloads` | base download directory |
+| `MEDIA_CLI_ARCHIVE_FILE` | `./downloaded.json` | record of finished tracks |
+| `MEDIA_CLI_SEARCH_COUNTRY` | `us` | storefront to search |
+| `MEDIA_CLI_SEARCH_LIMIT` | `20` | results offered per search |
 | `MEDIA_CLI_LYRICS_CONCURRENCY` | `4` | parallel lyrics lookups |
 
 ```bash
@@ -256,22 +475,30 @@ slowest and the least tolerant of concurrency.
 ## Reading the output
 
 ```
+Download directory: ./downloads/WORKOUT PLAYLIST 2026
+Archive: downloaded.json (312 track(s) already downloaded)
+
 [SESSION] Establishing session (no active session)
-[SKIP 03]     Already downloaded: 03 - Song - Artist
+[SKIP 03]     Already downloaded (archived): 03 - Song - Artist
+[SKIP 04]     Already downloaded (current naming): 04 - Song - Artist
 [RESOLVE 01]  ok: Song Name
 [ID3 01]      created: Song Name - Artist.mp3
 [MP3 01]      done: 01 - Song Name - Artist (6.38 MiB)
 ```
 
+`archived` means the archive recognised it; `current naming` and
+`legacy naming` mean a file was found in the output folder, and that
+track has now been added to the archive too.
+
 End-of-run summary:
 
 ```
 Total:       40
-Success:     38
-Skipped:     0
-Failed:      2
-Downloaded:  271.4 MiB
-Time:        3m12s
+Success:     2
+Skipped:     38  (archived 36, current naming 2)
+Failed:      0
+Downloaded:  13.6 MiB
+Time:        18.2s
 
 Sessions established: 1
 ```
@@ -400,11 +627,22 @@ add no load to the download service.
 
 ## How it works
 
-Four independently bounded stages, connected by channels:
+A pre-flight pass, then four independently bounded stages connected by
+channels:
 
 ```
-tracks → [resolve ×3] → [saveid3 ×3] → [download ×4] → [lyrics ×4] → results
+tracks → [already downloaded?] → [resolve ×3] → [saveid3 ×3] →
+         [download ×4] → [lyrics ×4] → results
+                │
+                └──→ downloaded.json
 ```
+
+The pre-flight pass is single-threaded and runs before the first
+request: it asks the archive, then the output directory, and everything
+recognised is settled as skipped there and then. A finished download
+records itself in the archive as it leaves the download stage — not
+after lyrics, because a track whose lyrics lookup never finishes is
+still a track that does not need downloading again.
 
 Each stage has its own worker pool, so a slow 7 MiB download does not
 occupy a slot that a resolve needs. One `http.Transport` is shared by

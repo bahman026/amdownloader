@@ -15,6 +15,10 @@ type ProcessResult struct {
 	Skipped bool
 	Bytes   int64
 
+	// SkipReason says what recognised the track: an archive record, or
+	// a file found in the output directory. Empty unless Skipped.
+	SkipReason string
+
 	// Lyrics records what the lyrics stage did: "synced", "none",
 	// "cached", "off", or a short failure note. It never affects
 	// whether the track counts as a success.
@@ -87,6 +91,12 @@ type Processor struct {
 	// which is the useful default.
 	DisableSkipExisting bool
 
+	// Archive is the persisted record of finished downloads. It is
+	// consulted before the output directory is, because it recognises a
+	// track wherever it was saved and whatever position it now holds in
+	// a playlist. A nil Archive turns the whole mechanism off.
+	Archive *Archive
+
 	// LyricsConcurrency and Lyrics control the optional final stage.
 	LyricsConcurrency int
 	Lyrics            *LyricsProvider
@@ -115,6 +125,16 @@ type Processor struct {
 
 // alreadyDownloaded reports whether the track can be skipped. Claim has
 // a side effect, so it is not called at all when skipping is off.
+//
+// The archive is asked first. It answers for tracks this run would not
+// otherwise recognise: a playlist that has been reordered, a song that
+// arrived here from a different playlist, an album track already pulled
+// down as a single.
+//
+// A track the archive does not know but the output directory does is
+// recorded on the spot, so a directory filled by earlier versions of
+// this program is adopted into the archive on the next run rather than
+// having to be downloaded again to get there.
 func (p *Processor) alreadyDownloaded(
 	completed *CompletedIndex,
 	track Track,
@@ -125,7 +145,61 @@ func (p *Processor) alreadyDownloaded(
 		return false, ""
 	}
 
-	return completed.Claim(track, plan)
+	if p.Archive.Claim(track) {
+		return true, "archived"
+	}
+
+	done, how, path := completed.ClaimFile(track, plan)
+
+	if done {
+		p.record(track, path, 0)
+	}
+
+	return done, how
+}
+
+// record writes one finished track to the archive.
+//
+// Called from the download workers as well as the pre-flight pass, so it
+// relies on Archive serialising the append. A failure to write is
+// reported and then dropped: the file is on disk either way, and losing
+// a run over a bookkeeping error would be the wrong trade.
+func (p *Processor) record(
+	track Track,
+	path string,
+	bytes int64,
+) {
+
+	if p.Archive == nil {
+		return
+	}
+
+	bitrate := 128
+
+	if p.transcoding() {
+		bitrate = p.Transcoder.bitrate()
+	}
+
+	mode := p.AudioMode
+
+	if strings.TrimSpace(mode) == "" {
+		mode = audioModeService
+	}
+
+	if err := p.Archive.Add(newArchiveEntry(
+		track,
+		path,
+		bytes,
+		mode,
+		bitrate,
+	)); err != nil {
+		p.Log.Printf(
+			"[ARCHIVE %02d] could not record %s: %v\n",
+			track.Index+1,
+			track.Name,
+			err,
+		)
+	}
 }
 
 func clampConcurrency(value, fallback int) int {
@@ -193,8 +267,9 @@ func (p *Processor) Process(
 			)
 
 			results <- ProcessResult{
-				Track:   track,
-				Skipped: true,
+				Track:      track,
+				Skipped:    true,
+				SkipReason: how,
 			}
 
 			continue
@@ -300,6 +375,14 @@ func (p *Processor) Process(
 				}
 
 				item.written = written
+
+				// Recorded here rather than after the lyrics stage:
+				// the file is complete and published at this point,
+				// and a track whose lyrics lookup never finishes is
+				// still a track that does not need downloading
+				// again.
+				p.record(item.track, path, written)
+
 				toLyrics <- item
 			}
 		}()
